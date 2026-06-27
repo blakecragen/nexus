@@ -1,0 +1,27 @@
+[project]
+name = "nexus-server"
+version = "0.1.0"
+description = "Nexus control plane API server"
+requires-python = ">=3.11"
+dependencies = [
+    "nexus-common",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "sqlalchemy[asyncio]>=2.0",
+    "aiosqlite>=0.20.0",
+    "alembic>=1.14.0",
+    "redis[hiredis]>=5.0",
+    "boto3>=1.35.0",
+    "pyjwt>=2.9.0",
+    "bcrypt>=4.2.0",
+    "cryptography>=43.0.0",
+    "python-multipart>=0.0.12",
+    "httpx>=0.27.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nexus_server"]

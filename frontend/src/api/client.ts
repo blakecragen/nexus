@@ -1,0 +1,164 @@
+import type { TokenResponse } from "@/types";
+
+const API_BASE = "/api";
+
+let accessToken: string | null = localStorage.getItem("nexus_token");
+
+export function setToken(token: string | null) {
+  accessToken = token;
+  if (token) {
+    localStorage.setItem("nexus_token", token);
+  } else {
+    localStorage.removeItem("nexus_token");
+  }
+}
+
+export function getToken(): string | null {
+  return accessToken;
+}
+
+async function request<T>(
+  path: string,
+  options: RequestInit = {}
+): Promise<T> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...(options.headers as Record<string, string>),
+  };
+
+  if (accessToken) {
+    headers["Authorization"] = `Bearer ${accessToken}`;
+  }
+
+  const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
+
+  if (res.status === 401) {
+    setToken(null);
+    window.location.href = "/login";
+    throw new Error("Unauthorized");
+  }
+
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(body.detail || `HTTP ${res.status}`);
+  }
+
+  if (res.status === 204) return undefined as T;
+  return res.json();
+}
+
+export const api = {
+  // Auth
+  login: (username: string, password: string) =>
+    request<TokenResponse>("/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    }),
+  refresh: (refreshToken: string) =>
+    request<TokenResponse>("/auth/refresh", {
+      method: "POST",
+      body: JSON.stringify({ refresh_token: refreshToken }),
+    }),
+  getMe: () => request<import("@/types").UserInfo>("/auth/me"),
+  register: (data: { username: string; password: string; email?: string; role?: string }) =>
+    request<import("@/types").UserInfo>("/auth/register", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+
+  // Nodes
+  listNodes: (params?: Record<string, string>) => {
+    const qs = params ? "?" + new URLSearchParams(params).toString() : "";
+    return request<import("@/types").NodeInfo[]>(`/nodes${qs}`);
+  },
+  getNode: (id: string) => request<import("@/types").NodeInfo>(`/nodes/${id}`),
+  createNode: (data: Record<string, unknown>) =>
+    request<import("@/types").NodeInfo & { api_key: string }>("/nodes", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+  deleteNode: (id: string) => request<void>(`/nodes/${id}`, { method: "DELETE" }),
+  setMaintenance: (id: string, enabled: boolean) =>
+    request<import("@/types").NodeInfo>(`/nodes/${id}/maintenance`, {
+      method: "PUT",
+      body: JSON.stringify({ maintenance: enabled }),
+    }),
+
+  // Pools
+  listPools: () => request<import("@/types").PoolInfo[]>("/pools"),
+  getPool: (id: string) =>
+    request<{ pool: import("@/types").PoolInfo; nodes: import("@/types").NodeInfo[] }>(`/pools/${id}`),
+  createPool: (data: { name: string; description?: string }) =>
+    request<import("@/types").PoolInfo>("/pools", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+  deletePool: (id: string) => request<void>(`/pools/${id}`, { method: "DELETE" }),
+  addNodeToPool: (poolId: string, nodeId: string) =>
+    request<void>(`/pools/${poolId}/nodes`, {
+      method: "POST",
+      body: JSON.stringify({ node_id: nodeId }),
+    }),
+  removeNodeFromPool: (poolId: string, nodeId: string) =>
+    request<void>(`/pools/${poolId}/nodes/${nodeId}`, { method: "DELETE" }),
+
+  // Jobs
+  listJobs: (params?: Record<string, string>) => {
+    const qs = params ? "?" + new URLSearchParams(params).toString() : "";
+    return request<import("@/types").JobInfo[]>(`/jobs${qs}`);
+  },
+  getJob: (id: string) => request<import("@/types").JobDetail>(`/jobs/${id}`),
+  submitJob: (data: {
+    name: string;
+    steps: import("@/types").StepConfig[];
+    target_pool_id?: string;
+    target_node_id?: string;
+    priority?: number;
+  }) =>
+    request<import("@/types").JobInfo>("/jobs", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+  cancelJob: (id: string) =>
+    request<import("@/types").JobInfo>(`/jobs/${id}/cancel`, { method: "POST" }),
+  deleteJob: (id: string) => request<void>(`/jobs/${id}`, { method: "DELETE" }),
+
+  // Steps
+  listSteps: () => request<import("@/types").StepSchemaInfo[]>("/steps"),
+  getStep: (name: string) => request<import("@/types").StepSchemaInfo>(`/steps/${name}`),
+
+  // Credentials
+  listCredentials: () => request<import("@/types").CredentialInfo[]>("/credentials"),
+  createCredential: (data: Record<string, unknown>) =>
+    request<import("@/types").CredentialInfo>("/credentials", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+  deleteCredential: (id: string) =>
+    request<void>(`/credentials/${id}`, { method: "DELETE" }),
+  testCredential: (id: string) =>
+    request<{ success: boolean; error?: string }>(`/credentials/${id}/test`, { method: "POST" }),
+  listCredentialTypes: () => request<import("@/types").CredentialTypeInfo[]>("/credentials/types"),
+
+  // Storage
+  listBackends: () => request<import("@/types").StorageBackendInfo[]>("/storage/backends"),
+  createBackend: (data: Record<string, unknown>) =>
+    request<import("@/types").StorageBackendInfo>("/storage/backends", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+  deleteBackend: (id: string) =>
+    request<void>(`/storage/backends/${id}`, { method: "DELETE" }),
+  checkBackendHealth: (id: string) =>
+    request<{ healthy: boolean }>(`/storage/backends/${id}/health`),
+  transferArtifact: (data: { artifact_id: string; dest_backend_id: string }) =>
+    request<import("@/types").TransferInfo>("/storage/transfer", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+  listTransfers: () => request<import("@/types").TransferInfo[]>("/storage/transfers"),
+
+  // Artifacts
+  listArtifacts: (jobId: string) =>
+    request<import("@/types").ArtifactInfo[]>(`/artifacts?job_id=${jobId}`),
+};

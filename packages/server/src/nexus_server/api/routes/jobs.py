@@ -1,0 +1,133 @@
+"""Job management routes — list, submit, detail, cancel, delete."""
+
+from __future__ import annotations
+
+from uuid import UUID
+
+from fastapi import APIRouter, HTTPException, status
+
+from nexus_common.models.schemas import JobDetail, JobInfo, JobSubmit, StepRunInfo
+from nexus_common.steps.registry import STEP_REGISTRY
+from nexus_server.api.deps import CurrentUser, DbSession, Runner
+from nexus_server.db import ops
+
+router = APIRouter()
+
+
+def _job_to_info(job) -> JobInfo:
+    return JobInfo(
+        id=job.id, name=job.name, submitted_by=job.submitted_by,
+        target_pool_id=job.target_pool_id, target_node_id=job.target_node_id,
+        priority=job.priority, status=job.status, current_step=job.current_step,
+        error=job.error, created_at=job.created_at,
+        started_at=job.started_at, completed_at=job.completed_at,
+    )
+
+
+def _step_run_to_info(sr) -> StepRunInfo:
+    return StepRunInfo(
+        id=sr.id, job_id=sr.job_id, step_index=sr.step_index,
+        step_name=sr.step_name, status=sr.status, node_id=sr.node_id,
+        input_params=sr.input_params, output_params=sr.output_params,
+        error=sr.error, started_at=sr.started_at, finished_at=sr.finished_at,
+    )
+
+
+@router.get("", response_model=list[JobInfo])
+async def list_jobs(
+    db: DbSession,
+    user: CurrentUser,
+    job_status: str | None = None,
+    pool_id: UUID | None = None,
+    limit: int = 50,
+    offset: int = 0,
+):
+    """List jobs with optional filtering and pagination."""
+    jobs = await ops.list_jobs(
+        db, status=job_status, pool_id=pool_id,
+        limit=limit, offset=offset,
+    )
+    return [_job_to_info(j) for j in jobs]
+
+
+@router.post("", response_model=JobInfo, status_code=status.HTTP_201_CREATED)
+async def submit_job(body: JobSubmit, db: DbSession, user: CurrentUser, runner: Runner):
+    """Submit a new job with step validation."""
+    # Validate that all step names are registered
+    for i, step_cfg in enumerate(body.steps):
+        if step_cfg.step not in STEP_REGISTRY:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Step {i} references unknown step '{step_cfg.step}'. "
+                       f"Available: {sorted(STEP_REGISTRY.keys())}",
+            )
+
+        # Run parameter validation on each step
+        step_cls = STEP_REGISTRY[step_cfg.step]
+        errors = step_cls.validate_params(step_cfg.params)
+        if errors:
+            detail = "; ".join(str(e) for e in errors)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Step {i} ('{step_cfg.step}') validation failed: {detail}",
+            )
+
+    # Persist job. Step runs are created lazily by the runner on each
+    # iteration so loops produce one row per attempt at the same step_index.
+    steps_config = [s.model_dump() for s in body.steps]
+    job = await ops.create_job(
+        db, name=body.name, submitted_by=user.id,
+        steps_config=steps_config,
+        target_pool_id=body.target_pool_id, target_node_id=body.target_node_id,
+        priority=body.priority, storage_target=body.storage_target,
+    )
+
+    # Hand the job to the runner for asynchronous execution.
+    await runner.submit_job(db, job.id)
+
+    return _job_to_info(job)
+
+
+@router.get("/{job_id}", response_model=JobDetail)
+async def get_job(job_id: UUID, db: DbSession, user: CurrentUser):
+    """Get job detail including step runs and context data."""
+    job = await ops.get_job_by_id(db, job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    step_runs = await ops.get_step_runs_for_job(db, job_id)
+    return JobDetail(
+        job=_job_to_info(job),
+        steps=[_step_run_to_info(sr) for sr in step_runs],
+        context_data=job.context_data or {},
+    )
+
+
+@router.post("/{job_id}/cancel", response_model=JobInfo)
+async def cancel_job(job_id: UUID, db: DbSession, user: CurrentUser, runner: Runner):
+    """Cancel a pending or running job."""
+    job = await ops.get_job_by_id(db, job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    if job.status in ("completed", "failed", "cancelled"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Job is already in terminal state: {job.status}",
+        )
+    await runner.cancel_job(db, job_id)
+    job = await ops.get_job_by_id(db, job_id)
+    return _job_to_info(job)
+
+
+@router.delete("/{job_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_job(job_id: UUID, db: DbSession, user: CurrentUser):
+    """Delete a job (must be in terminal state)."""
+    job = await ops.get_job_by_id(db, job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    if job.status not in ("completed", "failed", "cancelled"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Can only delete jobs in terminal state",
+        )
+    await db.delete(job)
+    await db.commit()

@@ -1,0 +1,57 @@
+# Nexus Frontend — Multi-stage Docker build
+# Stage 1 builds the Vite/React app; Stage 2 serves with nginx.
+
+# ── Stage 1: Build ─────────────────────────────────────────────────────
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# Copy package manifests first for Docker layer caching
+COPY frontend/src/package.json frontend/src/package-lock.json* ./
+
+RUN npm install
+
+# Copy source and build
+COPY frontend/src/ ./
+
+ARG VITE_API_URL=http://localhost:8000
+ARG VITE_WS_URL=ws://localhost:8000
+ENV VITE_API_URL=${VITE_API_URL}
+ENV VITE_WS_URL=${VITE_WS_URL}
+
+RUN npm run build
+
+# ── Stage 2: Serve ─────────────────────────────────────────────────────
+FROM nginx:alpine
+
+# Remove default nginx static assets
+RUN rm -rf /usr/share/nginx/html/*
+
+# Copy built frontend from builder
+COPY --from=builder /app/dist /usr/share/nginx/html
+
+# SPA fallback: serve index.html for all routes
+RUN printf 'server {\n\
+    listen 80;\n\
+    root /usr/share/nginx/html;\n\
+    index index.html;\n\
+    location / {\n\
+        try_files $uri $uri/ /index.html;\n\
+    }\n\
+    location /api/ {\n\
+        proxy_pass http://api:8000;\n\
+        proxy_set_header Host $host;\n\
+        proxy_set_header X-Real-IP $remote_addr;\n\
+    }\n\
+    location /ws/ {\n\
+        proxy_pass http://api:8000;\n\
+        proxy_http_version 1.1;\n\
+        proxy_set_header Upgrade $http_upgrade;\n\
+        proxy_set_header Connection "upgrade";\n\
+        proxy_set_header Host $host;\n\
+    }\n\
+}\n' > /etc/nginx/conf.d/default.conf
+
+EXPOSE 80
+
+CMD ["nginx", "-g", "daemon off;"]

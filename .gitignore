@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+.env
+*.db
+*.sqlite3
+node_modules/
+frontend/dist/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# Runtime artifacts
+.nexus-*
+*.log
+*.pid
+
+# Local editor / agent settings
+.claude/settings.local.json
+.DS_Store

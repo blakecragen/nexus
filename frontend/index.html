@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Nexus</title>
+    <!-- Critical CSS: paint the dark theme on first frame to avoid a white
+         flash before the JS/CSS bundle loads (must match index.css --color-*). -->
+    <style>
+      :root { color-scheme: dark; }
+      html, body {
+        margin: 0;
+        background-color: #0a0a0e;            /* fallback */
+        background-color: oklch(0.13 0.01 265);
+      }
+      body { color: oklch(0.93 0.005 265); }
+    </style>
+  </head>
+  <body class="min-h-screen bg-background antialiased">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
