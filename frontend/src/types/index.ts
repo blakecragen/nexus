@@ -88,6 +88,7 @@ export interface JobDetail {
   steps: StepRunInfo[];
   context_data: Record<string, unknown>;
   has_log?: boolean;
+  has_results?: boolean;
 }
 
 export interface FieldSchema {

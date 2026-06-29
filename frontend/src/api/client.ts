@@ -170,6 +170,27 @@ export const api = {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return res.text();
   },
+  getJobResultsManifest: (id: string) =>
+    request<{
+      archive_bytes: number;
+      entries: { path: string; size: number; is_dir: boolean }[];
+    }>(`/jobs/${id}/results/manifest`),
+  downloadJobResults: async (id: string): Promise<void> => {
+    // Authenticated download → Blob → client-side save (an <a href> wouldn't
+    // carry the Bearer token).
+    const headers: Record<string, string> = {};
+    const token = getToken();
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+    const res = await fetch(`${API_BASE}/jobs/${id}/results/download`, { headers });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `job_${id}_results.tar.gz`;
+    a.click();
+    URL.revokeObjectURL(url);
+  },
   submitJob: (data: {
     name: string;
     steps: import("@/types").StepConfig[];

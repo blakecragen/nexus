@@ -9,13 +9,21 @@ import {
   SkipForward,
   Ban,
   Download,
+  ChevronRight,
+  Folder,
+  FolderOpen,
+  FileText,
+  FileCode,
+  FileBarChart,
+  File as FileIcon,
+  Package,
 } from "lucide-react";
 import { api } from "@/api/client";
 import { useLiveLogsStore } from "@/stores";
 import { cn, formatBytes, formatRelativeTime } from "@/lib/utils";
 import type { JobDetail as JobDetailType, StepRunInfo, StepStatus, JobStatus, ArtifactInfo } from "@/types";
 
-type DetailTab = "logs" | "params" | "outputs" | "context" | "full-log";
+type DetailTab = "logs" | "params" | "outputs" | "context" | "full-log" | "results";
 
 function statusBadge(status: JobStatus) {
   const colors: Record<JobStatus, string> = {
@@ -78,6 +86,215 @@ function JsonBlock({ data }: { data: unknown }) {
   );
 }
 
+// ── Results file tree ──────────────────────────────────────────────────────
+
+type ManifestEntry = { path: string; size: number; is_dir: boolean };
+type TreeNode = {
+  name: string;
+  path: string;
+  isDir: boolean;
+  size: number;       // own size (files) or aggregate (dirs)
+  children: TreeNode[];
+};
+
+/** Build a nested tree from the flat tarball manifest. */
+function buildTree(entries: ManifestEntry[]): TreeNode {
+  const root: TreeNode = { name: "", path: "", isDir: true, size: 0, children: [] };
+  const dirOf = new Map<string, TreeNode>([["", root]]);
+
+  const ensureDir = (path: string): TreeNode => {
+    if (dirOf.has(path)) return dirOf.get(path)!;
+    const slash = path.lastIndexOf("/");
+    const parent = ensureDir(slash === -1 ? "" : path.slice(0, slash));
+    const node: TreeNode = {
+      name: path.slice(slash + 1),
+      path,
+      isDir: true,
+      size: 0,
+      children: [],
+    };
+    parent.children.push(node);
+    dirOf.set(path, node);
+    return node;
+  };
+
+  for (const e of entries) {
+    const clean = e.path.replace(/\/+$/, "");
+    if (!clean) continue;
+    if (e.is_dir) {
+      ensureDir(clean);
+    } else {
+      const slash = clean.lastIndexOf("/");
+      const parent = ensureDir(slash === -1 ? "" : clean.slice(0, slash));
+      parent.children.push({
+        name: clean.slice(slash + 1),
+        path: clean,
+        isDir: false,
+        size: e.size,
+        children: [],
+      });
+    }
+  }
+
+  // Aggregate dir sizes + sort (dirs first, then alpha).
+  const finalize = (node: TreeNode): number => {
+    if (!node.isDir) return node.size;
+    let total = 0;
+    for (const c of node.children) total += finalize(c);
+    node.size = total;
+    node.children.sort((a, b) =>
+      a.isDir === b.isDir ? a.name.localeCompare(b.name) : a.isDir ? -1 : 1
+    );
+    return total;
+  };
+  finalize(root);
+  return root;
+}
+
+function fileGlyph(name: string) {
+  const lower = name.toLowerCase();
+  if (lower === "stats.txt") return { Icon: FileBarChart, className: "text-emerald-400" };
+  if (lower.endsWith(".json") || lower.endsWith(".ini") || lower.endsWith(".dot"))
+    return { Icon: FileCode, className: "text-sky-400" };
+  if (lower.endsWith(".txt") || lower.endsWith(".bib") || lower.endsWith(".log"))
+    return { Icon: FileText, className: "text-zinc-400" };
+  return { Icon: FileIcon, className: "text-zinc-500" };
+}
+
+function TreeRow({ node, depth }: { node: TreeNode; depth: number }) {
+  const [open, setOpen] = useState(depth < 1); // top-level dir expanded by default
+  const pad = { paddingLeft: `${depth * 16 + 12}px` };
+  const isStats = !node.isDir && node.name.toLowerCase() === "stats.txt";
+
+  if (node.isDir) {
+    const FolderGlyph = open ? FolderOpen : Folder;
+    return (
+      <div>
+        <button
+          type="button"
+          onClick={() => setOpen((o) => !o)}
+          style={pad}
+          className="group flex w-full items-center gap-2 py-1.5 pr-3 text-left font-mono text-xs hover:bg-white/[0.04] transition-colors"
+        >
+          <ChevronRight
+            className={cn(
+              "h-3.5 w-3.5 shrink-0 text-zinc-500 transition-transform duration-150",
+              open && "rotate-90"
+            )}
+          />
+          <FolderGlyph className="h-3.5 w-3.5 shrink-0 text-amber-400/80" />
+          <span className="truncate text-zinc-200">{node.name}</span>
+          <span className="ml-auto shrink-0 tabular-nums text-[11px] text-zinc-600">
+            {node.children.length} item{node.children.length === 1 ? "" : "s"} · {formatBytes(node.size)}
+          </span>
+        </button>
+        {open && (
+          <div className="relative">
+            {/* indent guide line */}
+            <span
+              className="pointer-events-none absolute top-0 bottom-0 w-px bg-white/[0.06]"
+              style={{ left: `${depth * 16 + 19}px` }}
+            />
+            {node.children.map((c) => (
+              <TreeRow key={c.path} node={c} depth={depth + 1} />
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  const { Icon, className } = fileGlyph(node.name);
+  return (
+    <div
+      style={pad}
+      className={cn(
+        "flex items-center gap-2 py-1.5 pr-3 font-mono text-xs",
+        isStats ? "bg-emerald-500/[0.06]" : "hover:bg-white/[0.04] transition-colors"
+      )}
+    >
+      <span className="h-3.5 w-3.5 shrink-0" />
+      <Icon className={cn("h-3.5 w-3.5 shrink-0", className)} />
+      <span className={cn("truncate", isStats ? "text-emerald-300" : "text-zinc-300")}>
+        {node.name}
+      </span>
+      {isStats && (
+        <span className="shrink-0 rounded bg-emerald-500/15 px-1.5 py-px text-[10px] font-medium uppercase tracking-wide text-emerald-400">
+          stats
+        </span>
+      )}
+      <span className="ml-auto shrink-0 tabular-nums text-[11px] text-zinc-500">
+        {formatBytes(node.size)}
+      </span>
+    </div>
+  );
+}
+
+function ResultsTree({
+  manifest,
+  downloading,
+  onDownload,
+}: {
+  manifest: { archive_bytes: number; entries: ManifestEntry[] } | null;
+  downloading: boolean;
+  onDownload: () => void;
+}) {
+  if (!manifest) {
+    return (
+      <div className="flex items-center justify-center gap-2 py-16 text-sm text-muted-foreground">
+        <Loader2 className="h-4 w-4 animate-spin" />
+        Reading archive…
+      </div>
+    );
+  }
+
+  const tree = buildTree(manifest.entries);
+  const fileCount = manifest.entries.filter((e) => !e.is_dir).length;
+
+  return (
+    <div className="space-y-3">
+      {/* Header strip */}
+      <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-card/40 px-4 py-3">
+        <div className="flex items-center gap-3">
+          <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10">
+            <Package className="h-4.5 w-4.5 text-primary" />
+          </div>
+          <div className="leading-tight">
+            <div className="text-sm font-medium">results.tar.gz</div>
+            <div className="text-xs text-muted-foreground tabular-nums">
+              {fileCount} file{fileCount === 1 ? "" : "s"} · {formatBytes(manifest.archive_bytes)} compressed
+            </div>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={onDownload}
+          disabled={downloading}
+          className="inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50"
+        >
+          {downloading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+          Download
+        </button>
+      </div>
+
+      {/* Tree */}
+      <div className="overflow-hidden rounded-lg border border-border bg-gray-900/60">
+        <div className="border-b border-white/[0.06] px-3 py-2 font-mono text-[11px] uppercase tracking-wider text-zinc-500">
+          Archive contents
+        </div>
+        <div className="max-h-[440px] overflow-auto py-1">
+          {tree.children.length === 0 ? (
+            <div className="px-4 py-8 text-center text-xs text-muted-foreground">Archive is empty.</div>
+          ) : (
+            tree.children.map((c) => <TreeRow key={c.path} node={c} depth={0} />)
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
 export default function JobDetail() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -89,6 +306,10 @@ export default function JobDetail() {
   const [activeTab, setActiveTab] = useState<DetailTab>("logs");
   const [cancelling, setCancelling] = useState(false);
   const [fullLog, setFullLog] = useState<string>("");
+  const [resultsManifest, setResultsManifest] = useState<
+    { archive_bytes: number; entries: { path: string; size: number; is_dir: boolean }[] } | null
+  >(null);
+  const [downloadingResults, setDownloadingResults] = useState(false);
 
   const logs = useLiveLogsStore((s) => s.logs);
   const logContainerRef = useRef<HTMLDivElement>(null);
@@ -153,6 +374,28 @@ export default function JobDetail() {
     return () => { cancelled = true; if (interval) clearInterval(interval); };
   }, [activeTab, id, detail?.job.status]);
 
+  // Fetch the results manifest (file list inside the tarball) when its tab opens.
+  useEffect(() => {
+    if (activeTab !== "results" || !id || !detail?.has_results) return;
+    let cancelled = false;
+    api.getJobResultsManifest(id)
+      .then((m) => { if (!cancelled) setResultsManifest(m); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [activeTab, id, detail?.has_results]);
+
+  const handleDownloadResults = useCallback(async () => {
+    if (!id) return;
+    setDownloadingResults(true);
+    try {
+      await api.downloadJobResults(id);
+    } catch {
+      /* surfaced by api client */
+    } finally {
+      setDownloadingResults(false);
+    }
+  }, [id]);
+
   const handleCancel = useCallback(async () => {
     if (!id) return;
     setCancelling(true);
@@ -185,6 +428,7 @@ export default function JobDetail() {
     { key: "outputs", label: "Outputs" },
     { key: "context", label: "Context" },
     { key: "full-log", label: "Full Terminal Log" },
+    ...(detail.has_results ? [{ key: "results" as DetailTab, label: "Results" }] : []),
   ];
 
   return (
@@ -390,6 +634,14 @@ export default function JobDetail() {
                   {fullLog || "No terminal output captured yet."}
                 </pre>
               </div>
+            )}
+
+            {activeTab === "results" && (
+              <ResultsTree
+                manifest={resultsManifest}
+                downloading={downloadingResults}
+                onDownload={handleDownloadResults}
+              />
             )}
           </div>
         </div>

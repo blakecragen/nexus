@@ -159,6 +159,32 @@ async def download_job_results(job_id: UUID, db: DbSession, user: CurrentUser):
     )
 
 
+@router.get("/{job_id}/results/manifest")
+async def get_job_results_manifest(job_id: UUID, db: DbSession, user: CurrentUser):
+    """List the files inside a job's results tarball (for the file-tree view).
+
+    Returns {archive_bytes, entries: [{path, size, is_dir}]}.
+    """
+    import tarfile
+
+    job = await ops.get_job_by_id(db, job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    path = _job_results_path(job_id)
+    if not path.is_file():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No results for this job")
+    try:
+        with tarfile.open(path, "r:gz") as tar:
+            entries = [
+                {"path": m.name, "size": m.size, "is_dir": m.isdir()}
+                for m in tar.getmembers()
+            ]
+    except (tarfile.TarError, OSError) as exc:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail=f"Could not read archive: {exc}")
+    return {"archive_bytes": path.stat().st_size, "entries": entries}
+
+
 @router.get("/{job_id}/log")
 async def get_job_log(job_id: UUID, db: DbSession, user: CurrentUser, download: bool = False):
     """Return the aggregated per-job terminal log as plain text.
