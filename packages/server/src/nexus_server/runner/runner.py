@@ -325,7 +325,10 @@ class JobRunner:
         self._step_events[key] = asyncio.Event()
 
         try:
-            sent = await self._ws.send_to_agent(str(node.id), command.model_dump_json())
+            # send_to_agent → ws.send_json, which JSON-encodes once. Pass a dict
+            # (not model_dump_json()'s string) or the agent receives a quoted
+            # string and `data.get(...)` blows up.
+            sent = await self._ws.send_to_agent(str(node.id), command.model_dump(mode="json"))
             if not sent:
                 return {"status": "failed", "error": f"Agent for node {node.hostname} not connected"}
 

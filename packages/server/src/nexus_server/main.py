@@ -19,6 +19,7 @@ from nexus_server.services.credentials.manager import CredentialManager
 from nexus_server.services.storage.manager import StorageManager
 
 from nexus_server.api.routes import auth, credentials, jobs, nodes, pools, steps, storage, ws
+from nexus_server.api.routes import artifacts
 
 import nexus_steps  # noqa: F401 — triggers @register decorators, populates STEP_REGISTRY
 
@@ -120,6 +121,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(steps.router, prefix="/api/steps", tags=["steps"])
     app.include_router(credentials.router, prefix="/api/credentials", tags=["credentials"])
     app.include_router(storage.router, prefix="/api/storage", tags=["storage"])
+    app.include_router(artifacts.router, prefix="/api/artifacts", tags=["artifacts"])
     app.include_router(ws.router, tags=["websocket"])
 
     return app

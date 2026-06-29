@@ -31,6 +31,8 @@ from nexus_common.models.enums import StepResult
 from nexus_common.steps.base import FlowStep, StepContext
 from nexus_common.steps.registry import STEP_REGISTRY, get_step
 
+import nexus_steps  # noqa: F401 — triggers @register decorators, populates STEP_REGISTRY
+
 from nexus_agent.capability import _detect_os_type
 from nexus_agent.os_adapters import get_adapter
 

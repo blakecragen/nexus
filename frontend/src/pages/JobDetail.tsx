@@ -97,18 +97,19 @@ export default function JobDetail() {
   useEffect(() => {
     if (!id) return;
     setIsLoading(true);
-    Promise.all([api.getJob(id), api.listArtifacts(id)])
-      .then(([jobDetail, arts]) => {
+    api.getJob(id)
+      .then((jobDetail) => {
         setDetail(jobDetail);
-        setArtifacts(arts);
         // Select the running step by default if any
         const runningIdx = jobDetail.steps.findIndex((s) => s.status === "running");
         if (runningIdx >= 0) setSelectedStep(runningIdx);
       })
       .catch(() => {
-        // navigate back on error
+        // leave detail null; the page shows the loader/empty state
       })
       .finally(() => setIsLoading(false));
+    // Artifacts are optional — never let them block rendering the job.
+    api.listArtifacts(id).then(setArtifacts).catch(() => setArtifacts([]));
   }, [id]);
 
   // Poll for updates while job is active
@@ -119,15 +120,12 @@ export default function JobDetail() {
 
     const interval = setInterval(async () => {
       try {
-        const [updated, arts] = await Promise.all([
-          api.getJob(id),
-          api.listArtifacts(id),
-        ]);
+        const updated = await api.getJob(id);
         setDetail(updated);
-        setArtifacts(arts);
       } catch {
         // ignore polling errors
       }
+      api.listArtifacts(id).then(setArtifacts).catch(() => {});
     }, 3000);
 
     return () => clearInterval(interval);
