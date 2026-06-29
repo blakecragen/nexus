@@ -140,7 +140,7 @@ async def agent_websocket(ws: WebSocket, node_id: str, api_key: str | None = Non
         manager.disconnect_agent(node_id)
         # Mark node offline
         async for db in get_session():
-            await ops.update_node(db, UUID(node_id), status="offline")
+            await ops.update_node(db, node_id, status="offline")
             break
         await manager.broadcast_to_dashboards(
             DashboardNodeStatus(node_id=node_id, status="offline").model_dump(mode="json")
@@ -153,13 +153,13 @@ async def _handle_agent_message(
     """Route an inbound agent message to the appropriate handler."""
     if msg_type == "heartbeat":
         hb = AgentHeartbeat(**data)
-        await ops.update_node(db, UUID(node_id), last_heartbeat=datetime.now(timezone.utc), status="online")
+        await ops.update_node(db, node_id, last_heartbeat=datetime.now(timezone.utc), status="online")
         await ws.send_json(ServerAck(message="heartbeat_ok").model_dump(mode="json"))
 
     elif msg_type == "register":
         reg = AgentRegister(**data)
         await ops.update_node(
-            db, UUID(node_id),
+            db, node_id,
             hostname=reg.hostname, os_type=reg.os_type, os_version=reg.os_version,
             arch=reg.arch, cpu_model=reg.cpu_model, cpu_cores=reg.cpu_cores,
             ram_mb=reg.ram_mb, gpu_info=reg.gpu_info, agent_version=reg.agent_version,
@@ -173,11 +173,11 @@ async def _handle_agent_message(
         # (job_id, step_index) so crash recovery can resume polling without
         # re-running startup(). The runner is the single writer for the
         # final status / outputs / error fields.
-        latest = await ops.get_latest_step_run(db, UUID(info.job_id), info.step_index)
+        latest = await ops.get_latest_step_run(db, info.job_id, info.step_index)
         if latest is not None:
             await ops.update_step_run(
                 db, latest.id, status="running",
-                node_id=UUID(node_id), state=info.state,
+                node_id=node_id, state=info.state,
                 started_at=datetime.now(timezone.utc),
             )
         await manager.broadcast_to_dashboards(

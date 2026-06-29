@@ -62,7 +62,12 @@ async def list_jobs(
 @router.post("", response_model=JobInfo, status_code=status.HTTP_201_CREATED)
 async def submit_job(body: JobSubmit, db: DbSession, user: CurrentUser, runner: Runner):
     """Submit a new job with step validation."""
-    # Validate that all step names are registered
+    from nexus_common.steps.base import StepContext
+
+    # Validate each step, accumulating a context of what upstream steps will
+    # provide (their declared OUTPUT_KEYS + any explicit params) so that
+    # context-satisfiable fields downstream (e.g. m5out_path) validate correctly.
+    val_ctx = StepContext()
     for i, step_cfg in enumerate(body.steps):
         if step_cfg.step not in STEP_REGISTRY:
             raise HTTPException(
@@ -71,15 +76,20 @@ async def submit_job(body: JobSubmit, db: DbSession, user: CurrentUser, runner: 
                        f"Available: {sorted(STEP_REGISTRY.keys())}",
             )
 
-        # Run parameter validation on each step
+        # Run parameter validation on each step against the accumulated context.
         step_cls = STEP_REGISTRY[step_cfg.step]
-        errors = step_cls.validate_params(step_cfg.params)
+        errors = step_cls.validate_params(step_cfg.params, val_ctx)
         if errors:
             detail = "; ".join(str(e) for e in errors)
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Step {i} ('{step_cfg.step}') validation failed: {detail}",
             )
+
+        # This step's outputs become available to later steps.
+        for k in getattr(step_cls, "OUTPUT_KEYS", []):
+            val_ctx.outputs[k] = None
+        val_ctx.outputs.update(step_cfg.params)
 
     # Persist job. Step runs are created lazily by the runner on each
     # iteration so loops produce one row per attempt at the same step_index.
