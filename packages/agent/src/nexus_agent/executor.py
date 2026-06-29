@@ -106,8 +106,12 @@ class StepExecutor:
                 # Poll-based step — call check() in a loop
                 await self._poll_step(running)
 
-            # Step completed successfully
-            outputs = state.get("outputs", {})
+            # Step completed successfully. Build outputs from the step's declared
+            # OUTPUT_KEYS (steps put values directly in state, not under
+            # "outputs"). Fall back to an explicit "outputs" dict if present.
+            outputs = state.get("outputs")
+            if not isinstance(outputs, dict):
+                outputs = {k: state[k] for k in step_cls.OUTPUT_KEYS if k in state}
             command, stdout, stderr, exit_code = self._capture(running)
             await self._connection.send_message(
                 StepCompleted(
