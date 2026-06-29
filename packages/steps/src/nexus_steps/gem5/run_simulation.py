@@ -18,6 +18,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import uuid
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -120,21 +121,34 @@ class RunSimulationStep(FlowStep):
         validated = RunSimulationParams(**resolved)
 
         binary = validated.gem5_binary or "/usr/local/bin/gem5.opt"
-        cwd = validated.working_dir or os.getcwd()
 
         if validated.container:
-            # Run inside a Docker container. m5out must live under the mounted
-            # working_dir so the container's writes appear on the host.
+            # Run inside a Docker container. All gem5 paths (binary, config,
+            # working_dir, m5out) are CONTAINER paths — they may not exist on the
+            # host, so the host process must not touch them (no mkdtemp(dir=cwd),
+            # no cwd=). `docker exec -w` sets the working dir inside the container.
             docker = _find_docker(validated.docker)
             if not docker:
                 return {"error": "docker binary not found on node", "exit_code": -1}
             if not validated.working_dir:
                 return {"error": "working_dir is required when using `container`", "exit_code": -1}
-            m5out_dir = tempfile.mkdtemp(prefix="m5out_nexus_", dir=cwd)
+            cwd = validated.working_dir
+            # A unique m5out dir, relative to working_dir, created INSIDE the
+            # container. Random suffix without host filesystem access.
+            m5out_dir = f"{cwd.rstrip('/')}/m5out_nexus_{uuid.uuid4().hex[:8]}"
+            mk = subprocess.run(
+                [docker, "exec", validated.container, "mkdir", "-p", m5out_dir],
+                capture_output=True, text=True, timeout=30,
+            )
+            if mk.returncode != 0:
+                return {"error": f"could not create m5out in container: {mk.stderr.strip()}",
+                        "exit_code": mk.returncode}
             inner = [binary, f"--outdir={m5out_dir}", validated.config_script, *validated.script_args]
             cmd = [docker, "exec", "-w", cwd, validated.container, *inner]
+            host_cwd = None  # docker client runs from anywhere
         else:
             # Run gem5 directly on the node.
+            cwd = validated.working_dir or os.getcwd()
             m5out_dir = tempfile.mkdtemp(prefix="nexus_m5out_")
             cmd = [
                 binary,
@@ -142,6 +156,7 @@ class RunSimulationStep(FlowStep):
                 validated.config_script,
                 *validated.script_args,
             ]
+            host_cwd = cwd
 
         stdout_file = tempfile.NamedTemporaryFile(
             prefix="nexus_gem5_out_", suffix=".log", delete=False,
@@ -154,7 +169,7 @@ class RunSimulationStep(FlowStep):
             cmd,
             stdout=stdout_file,
             stderr=stderr_file,
-            cwd=cwd,
+            cwd=host_cwd,
             start_new_session=True,
         )
 
@@ -164,6 +179,8 @@ class RunSimulationStep(FlowStep):
         return {
             "pid": proc.pid,
             "m5out_path": m5out_dir,
+            "container": validated.container,
+            "docker": _find_docker(validated.docker) if validated.container else None,
             "stdout_path": stdout_file.name,
             "stderr_path": stderr_file.name,
             "timeout": validated.timeout,
@@ -189,10 +206,17 @@ class RunSimulationStep(FlowStep):
         # If stats collection is requested, check that stats.txt exists.
         if state.get("collect_stats"):
             stats_path = os.path.join(state["m5out_path"], "stats.txt")
-            if os.path.isfile(stats_path):
-                # In a real implementation the storage manager would upload
-                # this file and return an artifact ID.  We store the path
-                # as a placeholder.
+            container = state.get("container")
+            if container:
+                docker = state.get("docker") or "docker"
+                found = subprocess.run(
+                    [docker, "exec", container, "test", "-f", stats_path],
+                    capture_output=True, text=True, timeout=30,
+                ).returncode == 0
+            else:
+                found = os.path.isfile(stats_path)
+            if found:
+                # Placeholder until the storage manager uploads + returns an ID.
                 state["stats_artifact_id"] = stats_path
 
         return StepResult.SUCCESS if exit_status == 0 else StepResult.FAILED
