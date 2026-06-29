@@ -26,3 +26,6 @@ frontend/dist/
 # Local editor / agent settings
 .claude/settings.local.json
 .DS_Store
+
+# Per-job result uploads
+.nexus-results/

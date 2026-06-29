@@ -70,10 +70,16 @@ class StepExecutor:
             params = step_cls.resolve_for_os(cmd.params, os_type)
 
             # Build context (params already resolved server-side, but we carry os_type)
+            cfg = self._connection.config
+            # HTTP base from the ws:// server URL (ws://host:8000/ws/agent/.. → http://host:8000)
+            http_base = cfg.server_url.split("/ws/")[0].replace("ws://", "http://", 1).replace("wss://", "https://", 1)
             ctx = StepContext(
                 outputs=params,
                 os_type=os_type,
-                node_id=self._connection.config.node_id,
+                node_id=cfg.node_id,
+                job_id=cmd.job_id,
+                server_url=http_base,
+                node_api_key=cfg.api_key,
             )
 
             # Run startup()

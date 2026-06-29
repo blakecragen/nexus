@@ -1,15 +1,24 @@
-"""Collect gem5 m5out results and upload them as a Nexus artifact.
+"""Collect a gem5 m5out directory and upload it to the server as a downloadable
+per-job result artifact.
 
-Typically chained after ``gem5_run_simulation``.  The ``m5out_path``
-parameter is context-satisfiable from the upstream simulation step.
-LARGE_OUTPUT is set because m5out directories can contain multi-GB traces.
+Chained after ``gem5_run_simulation``; ``m5out_path`` is auto-resolved from the
+upstream step's context. Works whether gem5 ran directly on the node or inside a
+Docker container (``container`` is likewise resolved from context):
+
+  - container mode: tar m5out INSIDE the container, ``docker cp`` it to the host,
+    then upload to the server.
+  - direct mode: tar the host m5out directory, then upload.
+
+Upload is a PUT to ``/api/jobs/{job_id}/results`` authenticated by the node's
+api_key — no external storage backend required. LARGE_OUTPUT is set because
+m5out can be large.
 """
 
 from __future__ import annotations
 
-import json
 import os
-import tarfile
+import shutil
+import subprocess
 import tempfile
 from typing import Any
 
@@ -25,6 +34,23 @@ from nexus_common.steps.base import (
 from nexus_common.steps.registry import register
 
 
+def _find_docker(explicit: str | None) -> str | None:
+    if explicit:
+        return explicit
+    found = shutil.which("docker")
+    if found:
+        return found
+    for cand in (
+        "/usr/local/bin/docker",
+        "/opt/homebrew/bin/docker",
+        os.path.expanduser("~/.docker/bin/docker"),
+        "/Applications/Docker.app/Contents/Resources/bin/docker",
+    ):
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
 # ── Params ───────────────────────────────────────────────────────────────
 
 
@@ -33,21 +59,14 @@ class CollectResultsParams(BaseModel):
 
     m5out_path: str | None = Field(
         None,
-        description=(
-            "Path to the m5out directory. Auto-resolved from upstream "
-            "gem5_run_simulation context if omitted."
-        ),
+        description="Path to the m5out directory. Auto-resolved from upstream gem5_run_simulation.",
     )
-    working_dir: str | None = Field(
+    container: str | None = Field(
         None,
-        description="Working directory. Defaults to the parent of m5out_path.",
+        description="Docker container the m5out lives in. Auto-resolved from upstream if gem5 ran in a container.",
     )
-    storage_target: str = Field(
-        "default",
-        description=(
-            "Named storage backend for the artifact (e.g., 'default', 's3', "
-            "'local'). Resolved by the storage manager at upload time."
-        ),
+    docker: str | None = Field(
+        None, description="Path to the docker binary (auto-detected when omitted).",
     )
 
 
@@ -56,11 +75,11 @@ class CollectResultsParams(BaseModel):
 
 @register("gem5_collect_results")
 class CollectResultsStep(FlowStep):
-    """Package and upload gem5 m5out results as a Nexus artifact."""
+    """Package gem5 m5out results and upload them to the server."""
 
     PARAMS_SCHEMA = CollectResultsParams
-    OUTPUT_KEYS = ["results_artifact_id"]
-    DESCRIPTION = "Collect gem5 m5out results and store them as an artifact."
+    OUTPUT_KEYS = ["results_size_bytes", "results_url"]
+    DESCRIPTION = "Collect gem5 m5out results and store them as a downloadable artifact."
 
     SUPPORTED_OS = ["macos", "linux"]
     LARGE_OUTPUT = True
@@ -84,55 +103,72 @@ class CollectResultsStep(FlowStep):
         validated = CollectResultsParams(**resolved)
 
         m5out = validated.m5out_path
-        if not m5out or not os.path.isdir(m5out):
-            return {"error": f"m5out directory not found: {m5out}"}
+        if not m5out:
+            return {"error": "m5out_path not provided and not resolvable from context"}
 
-        # Create a tarball of the m5out directory.
         tar_path = tempfile.NamedTemporaryFile(
             prefix="nexus_m5out_", suffix=".tar.gz", delete=False,
         ).name
 
         try:
-            with tarfile.open(tar_path, "w:gz") as tar:
-                tar.add(m5out, arcname=os.path.basename(m5out))
-        except Exception as exc:
-            return {"error": f"Failed to archive m5out: {exc}"}
+            if validated.container:
+                # Tar INSIDE the container (m5out is a container path), stream the
+                # archive to the host file, so we never touch the path on the host.
+                docker = _find_docker(validated.docker)
+                if not docker:
+                    return {"error": "docker binary not found on node"}
+                parent = os.path.dirname(m5out.rstrip("/")) or "/"
+                base = os.path.basename(m5out.rstrip("/"))
+                with open(tar_path, "wb") as out:
+                    proc = subprocess.run(
+                        [docker, "exec", validated.container, "tar", "-czf", "-",
+                         "-C", parent, base],
+                        stdout=out, stderr=subprocess.PIPE, timeout=600,
+                    )
+                if proc.returncode != 0:
+                    return {"error": f"tar in container failed: {proc.stderr.decode()[:300]}"}
+            else:
+                if not os.path.isdir(m5out):
+                    return {"error": f"m5out directory not found on host: {m5out}"}
+                import tarfile
+                with tarfile.open(tar_path, "w:gz") as tar:
+                    tar.add(m5out, arcname=os.path.basename(m5out))
 
-        # Build a summary manifest.
-        manifest: dict[str, Any] = {
-            "m5out_path": m5out,
-            "archive_path": tar_path,
-            "archive_size_bytes": os.path.getsize(tar_path),
-            "storage_target": validated.storage_target,
-            "files": [],
-        }
-        for entry in os.listdir(m5out):
-            full = os.path.join(m5out, entry)
-            if os.path.isfile(full):
-                manifest["files"].append({
-                    "name": entry,
-                    "size_bytes": os.path.getsize(full),
-                })
+            size = os.path.getsize(tar_path)
 
-        manifest_path = tar_path.replace(".tar.gz", "_manifest.json")
-        with open(manifest_path, "w") as fh:
-            json.dump(manifest, fh, indent=2)
+            # Upload to the server (PUT /api/jobs/{job_id}/results), authed by node key.
+            if not (ctx.server_url and ctx.job_id and ctx.node_api_key):
+                return {"error": "missing server callback info (server_url/job_id/node_api_key)"}
+            import httpx
+            url = f"{ctx.server_url}/api/jobs/{ctx.job_id}/results"
+            with open(tar_path, "rb") as fh:
+                r = httpx.put(
+                    url,
+                    headers={"X-Node-Key": ctx.node_api_key},
+                    files={"file": ("results.tar.gz", fh, "application/gzip")},
+                    timeout=600,
+                )
+            if r.status_code >= 300:
+                return {"error": f"upload failed: HTTP {r.status_code} {r.text[:200]}"}
 
-        # In a full implementation the storage manager would upload the
-        # tarball and return an artifact ID.  We use the archive path as
-        # a placeholder.
-        return {
-            "results_artifact_id": tar_path,
-            "manifest_path": manifest_path,
-            "done": True,
-        }
+            return {
+                "results_size_bytes": size,
+                "results_url": f"{ctx.server_url}/api/jobs/{ctx.job_id}/results/download",
+                "done": True,
+                "_command_str": f"collect+upload m5out ({size} bytes) -> {url}",
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"{type(exc).__name__}: {exc}"}
+        finally:
+            try:
+                os.unlink(tar_path)
+            except OSError:
+                pass
 
     def check(self, state: dict[str, Any]) -> StepResult:
         if "error" in state:
             return StepResult.FAILED
-        if state.get("done"):
-            return StepResult.SUCCESS
-        return StepResult.RUNNING
+        return StepResult.SUCCESS if state.get("done") else StepResult.RUNNING
 
     def cancel(self, state: dict[str, Any]) -> None:
         # Collection is synchronous in startup(); nothing to cancel.

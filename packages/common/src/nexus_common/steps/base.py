@@ -36,6 +36,10 @@ class StepContext:
     outputs: dict[str, Any] = field(default_factory=dict)
     os_type: OSType | None = None
     node_id: str | None = None
+    # Set by the agent so steps can call back to the server (e.g. upload results).
+    job_id: str | None = None
+    server_url: str | None = None     # HTTP base, e.g. http://host:8000
+    node_api_key: str | None = None
 
     def resolve(self, params: dict[str, Any]) -> dict[str, Any]:
         """Merge context outputs with explicit params. Explicit params win."""

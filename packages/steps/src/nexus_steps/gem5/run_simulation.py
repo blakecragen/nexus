@@ -103,7 +103,7 @@ class RunSimulationStep(FlowStep):
     """Run a gem5 architectural simulation."""
 
     PARAMS_SCHEMA = RunSimulationParams
-    OUTPUT_KEYS = ["exit_code", "stats_artifact_id", "m5out_path"]
+    OUTPUT_KEYS = ["exit_code", "stats_artifact_id", "m5out_path", "container"]
     DESCRIPTION = "Run a gem5 simulation and collect results."
 
     SUPPORTED_OS = ["macos", "linux"]

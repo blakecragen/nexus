@@ -158,6 +158,7 @@ class JobDetail(BaseModel):
     steps: list[StepRunInfo]
     context_data: dict = Field(default_factory=dict)
     has_log: bool = False
+    has_results: bool = False
 
 
 # ── Steps Schema ────────────────────────────────────────────────────────

@@ -1,11 +1,12 @@
-"""Job management routes — list, submit, detail, cancel, delete."""
+"""Job management routes — list, submit, detail, cancel, delete, results."""
 
 from __future__ import annotations
 
+from pathlib import Path
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, status
-from fastapi.responses import PlainTextResponse
+from fastapi import APIRouter, HTTPException, Request, UploadFile, status
+from fastapi.responses import FileResponse, PlainTextResponse
 
 from nexus_common.models.schemas import JobDetail, JobInfo, JobSubmit, StepRunInfo
 from nexus_common.steps.registry import STEP_REGISTRY
@@ -13,6 +14,13 @@ from nexus_server.api.deps import CurrentUser, DbSession, Runner
 from nexus_server.db import ops
 
 router = APIRouter()
+
+# Per-job result artifacts uploaded by agents (no external storage backend needed).
+RESULTS_DIR = Path(".nexus-results")
+
+
+def _job_results_path(job_id) -> Path:
+    return RESULTS_DIR / str(job_id) / "results.tar.gz"
 
 
 def _job_to_info(job) -> JobInfo:
@@ -101,6 +109,43 @@ async def get_job(job_id: UUID, db: DbSession, user: CurrentUser):
         steps=[_step_run_to_info(sr) for sr in step_runs],
         context_data=job.context_data or {},
         has_log=bool(job.log_text),
+        has_results=_job_results_path(job_id).is_file(),
+    )
+
+
+@router.put("/{job_id}/results")
+async def upload_job_results(job_id: UUID, request: Request, db: DbSession, file: UploadFile):
+    """Agent uploads a job's result tarball. Authenticated by node api_key
+    (header X-Node-Key), since this is called by the agent, not a logged-in user."""
+    node_key = request.headers.get("X-Node-Key", "")
+    node = await ops.get_node_by_api_key(db, node_key) if node_key else None
+    if not node:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid node key")
+    job = await ops.get_job_by_id(db, job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    dest = _job_results_path(job_id)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    size = 0
+    with open(dest, "wb") as out:
+        while chunk := await file.read(1024 * 1024):
+            out.write(chunk)
+            size += len(chunk)
+    return {"ok": True, "size_bytes": size}
+
+
+@router.get("/{job_id}/results/download")
+async def download_job_results(job_id: UUID, db: DbSession, user: CurrentUser):
+    """Download a job's collected results tarball."""
+    job = await ops.get_job_by_id(db, job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    path = _job_results_path(job_id)
+    if not path.is_file():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No results for this job")
+    return FileResponse(
+        path, media_type="application/gzip", filename=f"job_{job_id}_results.tar.gz",
     )
 
 
