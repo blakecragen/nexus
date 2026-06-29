@@ -98,6 +98,7 @@ class RunCommandStep(FlowStep):
             "stdout_path": stdout_file.name,
             "stderr_path": stderr_file.name,
             "timeout": validated.timeout,
+            "_command_str": f"{shell} -c {validated.command!r}",
         }
 
     def check(self, state: dict[str, Any]) -> StepResult:

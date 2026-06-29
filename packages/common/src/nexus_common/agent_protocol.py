@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 
 
 class AgentRegister(BaseModel):
-    """Sent once on connection to identify the agent and report capabilities."""
+    """Sent once on connection to identify the agent."""
     type: Literal["register"] = "register"
     node_id: str
     hostname: str
@@ -29,7 +29,6 @@ class AgentRegister(BaseModel):
     gpu_info: str | None = None
     agent_version: str
     ip_address: str
-    capabilities: dict = Field(default_factory=dict)
     tags: list[str] = Field(default_factory=list)
 
 
@@ -76,6 +75,11 @@ class StepCompleted(BaseModel):
     job_id: str
     step_index: int
     outputs: dict[str, Any]  # merged into job context
+    # Captured terminal output for the per-job log (optional; agent fills these).
+    command: str | None = None
+    stdout: str | None = None
+    stderr: str | None = None
+    exit_code: int | None = None
 
 
 class StepFailed(BaseModel):
@@ -85,6 +89,10 @@ class StepFailed(BaseModel):
     step_index: int
     error: str
     exit_code: int | None = None
+    # Captured terminal output for the per-job log (optional; agent fills these).
+    command: str | None = None
+    stdout: str | None = None
+    stderr: str | None = None
 
 
 # ── Server → Agent Messages ─────────────────────────────────────────────

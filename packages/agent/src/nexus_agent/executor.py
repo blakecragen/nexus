@@ -105,33 +105,46 @@ class StepExecutor:
 
             # Step completed successfully
             outputs = state.get("outputs", {})
+            command, stdout, stderr, exit_code = self._capture(running)
             await self._connection.send_message(
                 StepCompleted(
                     job_id=cmd.job_id,
                     step_index=cmd.step_index,
                     outputs=outputs,
+                    command=command,
+                    stdout=stdout,
+                    stderr=stderr,
+                    exit_code=exit_code,
                 ).model_dump(mode="json")
             )
             logger.info("Step %s/%d completed successfully", cmd.job_id, cmd.step_index)
 
         except asyncio.CancelledError:
             logger.info("Step %s/%d was cancelled", cmd.job_id, cmd.step_index)
+            command, stdout, stderr, _ = self._capture(self._running_steps.get(key))
             await self._connection.send_message(
                 StepFailed(
                     job_id=cmd.job_id,
                     step_index=cmd.step_index,
                     error="Step cancelled",
                     exit_code=None,
+                    command=command,
+                    stdout=stdout,
+                    stderr=stderr,
                 ).model_dump(mode="json")
             )
         except Exception as exc:
             logger.error("Step %s/%d failed: %s", cmd.job_id, cmd.step_index, exc, exc_info=True)
+            command, stdout, stderr, exit_code = self._capture(self._running_steps.get(key))
             await self._connection.send_message(
                 StepFailed(
                     job_id=cmd.job_id,
                     step_index=cmd.step_index,
                     error=str(exc),
-                    exit_code=getattr(exc, "returncode", None),
+                    exit_code=getattr(exc, "returncode", None) or exit_code,
+                    command=command,
+                    stdout=stdout,
+                    stderr=stderr,
                 ).model_dump(mode="json")
             )
         finally:
@@ -202,6 +215,7 @@ class StepExecutor:
                 if not line:
                     break
                 text = line.decode("utf-8", errors="replace").rstrip("\n")
+                running.captured[stream_name].append(text)  # buffer for the per-job log
                 await self._connection.send_message(
                     StepLog(
                         job_id=running.job_id,
@@ -218,6 +232,7 @@ class StepExecutor:
         )
 
         exit_code = await process.wait()
+        running.state["exit_code"] = exit_code
 
         if exit_code != 0:
             raise SubprocessError(
@@ -229,6 +244,42 @@ class StepExecutor:
         result = running.step.check(running.state)
         if result == StepResult.FAILED:
             raise StepCheckFailed("Step check() returned FAILED after subprocess")
+
+    # ── Output capture (for the per-job terminal log) ──────────────────
+
+    _CAP_BYTES = 256 * 1024  # keep the tail of each stream, per step
+
+    def _capture(self, running: _RunningStep | None):
+        """Return (command, stdout, stderr, exit_code) for a finished step.
+
+        Command-streaming steps buffer lines in memory; poll-based steps (the
+        shipped run_command/gem5 steps) wrote to temp files — read those back.
+        Each stream is truncated to the last _CAP_BYTES.
+        """
+        if running is None:
+            return None, None, None, None
+        state = running.state
+        command = state.get("_command_str") or state.get("command")
+        exit_code = state.get("exit_code")
+
+        def _read(stream_name: str, path_key: str) -> str | None:
+            buf = running.captured.get(stream_name)
+            if buf:
+                text = "\n".join(buf)
+            else:
+                path = state.get(path_key)
+                if not path:
+                    return None
+                try:
+                    with open(path, "r", encoding="utf-8", errors="replace") as f:
+                        text = f.read()
+                except OSError:
+                    return None
+            if len(text) > self._CAP_BYTES:
+                text = "…[truncated]…\n" + text[-self._CAP_BYTES:]
+            return text or None
+
+        return command, _read("stdout", "stdout_path"), _read("stderr", "stderr_path"), exit_code
 
     # ── Poll-based Execution ───────────────────────────────────────────
 
@@ -252,7 +303,7 @@ class StepExecutor:
 class _RunningStep:
     """Tracks a single step execution in progress."""
 
-    __slots__ = ("job_id", "step_index", "step", "state", "params", "process", "task")
+    __slots__ = ("job_id", "step_index", "step", "state", "params", "process", "task", "captured")
 
     def __init__(
         self,
@@ -269,6 +320,7 @@ class _RunningStep:
         self.params = params
         self.process: asyncio.subprocess.Process | None = None
         self.task: asyncio.Task | None = None
+        self.captured: dict[str, list[str]] = {"stdout": [], "stderr": []}
 
 
 class SubprocessError(Exception):

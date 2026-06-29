@@ -35,7 +35,6 @@ export interface NodeInfo {
   agent_version: string;
   ip_address: string;
   status: NodeStatus;
-  capabilities: Record<string, unknown>;
   tags: string[];
   last_heartbeat: string | null;
   registered_at: string;
@@ -88,6 +87,7 @@ export interface JobDetail {
   job: JobInfo;
   steps: StepRunInfo[];
   context_data: Record<string, unknown>;
+  has_log?: boolean;
 }
 
 export interface FieldSchema {
@@ -104,7 +104,6 @@ export interface StepSchemaInfo {
   description: string;
   requires_node: boolean;
   supported_os: string[];
-  required_capabilities: string[];
   output_keys: string[];
   fields: FieldSchema[];
   rules: { rule_type: string; fields: string[]; description?: string }[];

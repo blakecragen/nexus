@@ -98,7 +98,6 @@ class Node(Base):
     agent_version: Mapped[str | None] = mapped_column(String(32))
     ip_address: Mapped[str | None] = mapped_column(String(45))
     status: Mapped[str] = mapped_column(String(16), default="offline")
-    capabilities: Mapped[dict] = mapped_column(JSON, default=dict)
     tags: Mapped[list] = mapped_column(JSON, default=list)
     last_heartbeat: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     registered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
@@ -211,6 +210,7 @@ class Job(Base):
     current_step: Mapped[int] = mapped_column(Integer, default=0)
     error: Mapped[str | None] = mapped_column(Text)
     context_data: Mapped[dict] = mapped_column(JSON, default=dict)
+    log_text: Mapped[str | None] = mapped_column(Text)  # aggregated per-job terminal log
     storage_target: Mapped[str | None] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

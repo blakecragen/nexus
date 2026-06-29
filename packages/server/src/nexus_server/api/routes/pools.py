@@ -27,7 +27,7 @@ def _node_to_info(node) -> NodeInfo:
         cpu_model=node.cpu_model or "", cpu_cores=node.cpu_cores or 0,
         ram_mb=node.ram_mb or 0, gpu_info=node.gpu_info,
         agent_version=node.agent_version or "", ip_address=node.ip_address or "",
-        status=node.status, capabilities=node.capabilities or {},
+        status=node.status,
         tags=node.tags or [], last_heartbeat=node.last_heartbeat,
         registered_at=node.registered_at,
     )

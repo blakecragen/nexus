@@ -1,13 +1,14 @@
-"""Auto-detect node capabilities for registration.
+"""Auto-detect host info for node registration.
 
-Gathers hardware info, OS details, architecture, and available software
-to help the scheduler assign steps to compatible nodes.
+Gathers hardware info, OS details, and architecture so the scheduler can match
+steps to OS-compatible nodes. (Software "capabilities" detection was removed —
+whether a node can run gem5/git/etc. is the operator's responsibility, proven by
+actually running a job; see the per-job terminal log.)
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import platform
 import shutil
 import socket
@@ -20,9 +21,9 @@ logger = logging.getLogger("nexus.agent.capability")
 
 
 def detect_capabilities() -> dict[str, Any]:
-    """Detect and return a full capability report for this node.
+    """Detect and return host info for this node.
 
-    Returns a dict compatible with AgentRegister fields.
+    Returns a dict compatible with AgentRegister fields (no software list).
     """
     return {
         "hostname": platform.node(),
@@ -34,7 +35,6 @@ def detect_capabilities() -> dict[str, Any]:
         "ram_mb": round(psutil.virtual_memory().total / (1024 * 1024)),
         "gpu_info": _detect_gpu(),
         "ip_address": _detect_ip(),
-        "software": _detect_software(),
     }
 
 
@@ -170,40 +170,3 @@ def _detect_ip() -> str:
             return s.getsockname()[0]
     except Exception:
         return "127.0.0.1"
-
-
-# ── Software ───────────────────────────────────────────────────────────
-
-
-# Tools the scheduler may need to know about for step compatibility
-_SOFTWARE_PROBES: list[tuple[str, str | list[str]]] = [
-    ("git", "git"),
-    ("docker", "docker"),
-    ("python3", "python3"),
-    ("pip", "pip3"),
-    ("node", "node"),
-    ("npm", "npm"),
-    ("gem5", "gem5"),
-    ("make", "make"),
-    ("cmake", "cmake"),
-    ("gcc", "gcc"),
-    ("clang", "clang"),
-    ("java", "java"),
-    ("ruby", "ruby"),
-    ("go", "go"),
-    ("rust", "rustc"),
-    ("brew", "brew"),
-    ("apt", "apt-get"),
-    ("choco", "choco"),
-]
-
-
-def _detect_software() -> dict[str, bool]:
-    """Check for presence of common software tools."""
-    result: dict[str, bool] = {}
-    for name, cmd in _SOFTWARE_PROBES:
-        if isinstance(cmd, list):
-            result[name] = any(shutil.which(c) is not None for c in cmd)
-        else:
-            result[name] = shutil.which(cmd) is not None
-    return result

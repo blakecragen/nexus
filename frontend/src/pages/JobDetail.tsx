@@ -15,7 +15,7 @@ import { useLiveLogsStore } from "@/stores";
 import { cn, formatBytes, formatRelativeTime } from "@/lib/utils";
 import type { JobDetail as JobDetailType, StepRunInfo, StepStatus, JobStatus, ArtifactInfo } from "@/types";
 
-type DetailTab = "logs" | "params" | "outputs" | "context";
+type DetailTab = "logs" | "params" | "outputs" | "context" | "full-log";
 
 function statusBadge(status: JobStatus) {
   const colors: Record<JobStatus, string> = {
@@ -88,6 +88,7 @@ export default function JobDetail() {
   const [selectedStep, setSelectedStep] = useState<number>(0);
   const [activeTab, setActiveTab] = useState<DetailTab>("logs");
   const [cancelling, setCancelling] = useState(false);
+  const [fullLog, setFullLog] = useState<string>("");
 
   const logs = useLiveLogsStore((s) => s.logs);
   const logContainerRef = useRef<HTMLDivElement>(null);
@@ -142,6 +143,18 @@ export default function JobDetail() {
     }
   }, [currentLogs.length]);
 
+  // Fetch the persisted per-job terminal log when its tab is open (and refresh
+  // while the job is still active).
+  useEffect(() => {
+    if (activeTab !== "full-log" || !id) return;
+    let cancelled = false;
+    const load = () => api.getJobLog(id).then((t) => { if (!cancelled) setFullLog(t); }).catch(() => {});
+    load();
+    const active = ["pending", "queued", "running"].includes(detail?.job.status ?? "");
+    const interval = active ? setInterval(load, 3000) : undefined;
+    return () => { cancelled = true; if (interval) clearInterval(interval); };
+  }, [activeTab, id, detail?.job.status]);
+
   const handleCancel = useCallback(async () => {
     if (!id) return;
     setCancelling(true);
@@ -173,6 +186,7 @@ export default function JobDetail() {
     { key: "params", label: "Params" },
     { key: "outputs", label: "Outputs" },
     { key: "context", label: "Context" },
+    { key: "full-log", label: "Full Terminal Log" },
   ];
 
   return (
@@ -348,6 +362,36 @@ export default function JobDetail() {
 
             {activeTab === "context" && (
               <JsonBlock data={context_data} />
+            )}
+
+            {activeTab === "full-log" && (
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs text-muted-foreground">
+                    Every command run for this job and its full stdout/stderr.
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const blob = new Blob([fullLog], { type: "text/plain" });
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement("a");
+                      a.href = url;
+                      a.download = `job_${job.id}.txt`;
+                      a.click();
+                      URL.revokeObjectURL(url);
+                    }}
+                    disabled={!fullLog}
+                    className="inline-flex items-center gap-2 rounded-lg border border-border px-3 py-1.5 text-xs font-medium hover:bg-muted transition-colors disabled:opacity-50"
+                  >
+                    <Download className="h-3.5 w-3.5" />
+                    Download .txt
+                  </button>
+                </div>
+                <pre className="h-[500px] overflow-auto rounded-lg bg-gray-900 p-4 font-mono text-xs leading-relaxed text-green-400 whitespace-pre-wrap">
+                  {fullLog || "No terminal output captured yet."}
+                </pre>
+              </div>
             )}
           </div>
         </div>

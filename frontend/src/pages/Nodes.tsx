@@ -16,6 +16,7 @@ import {
   Copy,
   Check,
   KeyRound,
+  Power,
 } from "lucide-react";
 import { useNodesStore, useAuthStore } from "@/stores";
 import { api } from "@/api/client";
@@ -197,6 +198,171 @@ function DeleteDialog({
 }
 
 // ---------------------------------------------------------------------------
+// Reconnect (Bring Online) Dialog
+// ---------------------------------------------------------------------------
+
+function ReconnectDialog({
+  node,
+  onClose,
+  onDone,
+}: {
+  node: NodeInfo;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  // Default SSH host to the node's last-known IP if it's real.
+  const defaultHost = node.ip_address && node.ip_address !== "0.0.0.0" ? node.ip_address : "";
+  const [sshHost, setSshHost] = useState(defaultHost);
+  const [sshUser, setSshUser] = useState("");
+  const [sshPassword, setSshPassword] = useState("");
+  const [useServerKey, setUseServerKey] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [errorLog, setErrorLog] = useState<string[]>([]);
+  const [done, setDone] = useState<{ online: boolean; log: string[] } | null>(null);
+
+  const incomplete = !sshHost.trim() || !sshUser.trim() || (!useServerKey && !sshPassword);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSubmitting(true);
+    setError(null);
+    setErrorLog([]);
+    try {
+      const res = await api.reconnectNode(node.id, {
+        ssh_host: sshHost.trim(),
+        ssh_user: sshUser.trim(),
+        ssh_password: useServerKey ? undefined : sshPassword,
+        use_server_key: useServerKey,
+      });
+      setDone({ online: res.online, log: res.log || [] });
+      onDone();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to bring node online");
+      setErrorLog(((err as Error & { log?: string[] }).log) || []);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 p-4">
+      <div className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-xl border border-border bg-background p-6 shadow-xl">
+        <div className="flex items-center justify-between">
+          <h3 className="text-lg font-semibold">Bring Node Online</h3>
+          <button type="button" onClick={onClose} className="rounded-lg p-1.5 hover:bg-muted transition-colors">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        {!done ? (
+          <form onSubmit={handleSubmit} className="mt-4 space-y-4">
+            <p className="text-sm text-muted-foreground">
+              Reconnects <span className="font-medium text-foreground">{node.display_name || node.hostname}</span>{" "}
+              by SSHing in and restarting its agent (re-picking a reachable address). SSH credentials
+              aren't stored, so re-enter them.
+            </p>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label htmlFor="rc-host" className="mb-1.5 block text-sm font-medium">SSH host / IP</label>
+                <input
+                  id="rc-host" type="text" value={sshHost}
+                  onChange={(e) => setSshHost(e.target.value)}
+                  placeholder="192.168.1.50"
+                  className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+                  autoFocus={!defaultHost}
+                />
+              </div>
+              <div>
+                <label htmlFor="rc-user" className="mb-1.5 block text-sm font-medium">SSH user</label>
+                <input
+                  id="rc-user" type="text" value={sshUser}
+                  onChange={(e) => setSshUser(e.target.value)}
+                  placeholder="ubuntu"
+                  className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+                  autoFocus={!!defaultHost}
+                />
+              </div>
+            </div>
+
+            <label className="flex cursor-pointer items-center gap-2 text-sm">
+              <input type="checkbox" checked={useServerKey} onChange={(e) => setUseServerKey(e.target.checked)} className="h-4 w-4" />
+              Use the server's SSH key / agent (no password)
+            </label>
+
+            {!useServerKey && (
+              <div>
+                <label htmlFor="rc-pass" className="mb-1.5 block text-sm font-medium">SSH password</label>
+                <input
+                  id="rc-pass" type="password" value={sshPassword}
+                  onChange={(e) => setSshPassword(e.target.value)}
+                  placeholder="••••••••" autoComplete="new-password"
+                  className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+                />
+              </div>
+            )}
+
+            {submitting && (
+              <p className="rounded-lg bg-muted px-3 py-2 text-xs text-muted-foreground">
+                Reconnecting over SSH — this can take a moment.
+              </p>
+            )}
+            {error && (
+              <div className="rounded-lg bg-red-50 px-3 py-2 dark:bg-red-950">
+                <p className="text-sm text-red-600 dark:text-red-400">{error}</p>
+                {errorLog.length > 0 && (
+                  <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap text-xs text-red-700/80 dark:text-red-400/80">
+                    {errorLog.join("\n")}
+                  </pre>
+                )}
+              </div>
+            )}
+
+            <div className="flex justify-end gap-3 pt-2">
+              <button type="button" onClick={onClose} className="rounded-lg border border-border px-4 py-2 text-sm font-medium hover:bg-muted transition-colors">
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={submitting || incomplete}
+                className="inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50"
+              >
+                {submitting && <Loader2 className="h-4 w-4 animate-spin" />}
+                Bring Online
+              </button>
+            </div>
+          </form>
+        ) : (
+          <div className="mt-4 space-y-4">
+            <p className={cn(
+              "rounded-lg px-3 py-2 text-sm",
+              done.online
+                ? "bg-green-50 text-green-700 dark:bg-green-950/50 dark:text-green-400"
+                : "bg-yellow-50 text-yellow-700 dark:bg-yellow-950/50 dark:text-yellow-400"
+            )}>
+              {done.online
+                ? "Agent reconnected — the node is online."
+                : "Agent installed + started, but it hasn't connected back yet (the WebSocket isn't completing — likely VPN/firewall or routing). It keeps retrying; see the log."}
+            </p>
+            {done.log.length > 0 && (
+              <pre className="max-h-56 overflow-auto whitespace-pre-wrap rounded-lg border border-border bg-muted px-3 py-2 text-xs">
+                {done.log.join("\n")}
+              </pre>
+            )}
+            <div className="flex justify-end pt-2">
+              <button type="button" onClick={onClose} className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors">
+                Done
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Node Detail Panel (slide-over)
 // ---------------------------------------------------------------------------
 
@@ -213,6 +379,7 @@ function NodeDetailPanel({
   const isAdmin = user?.role === "admin";
   const [maintenanceLoading, setMaintenanceLoading] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
+  const [reconnectOpen, setReconnectOpen] = useState(false);
 
   const toggleMaintenance = async () => {
     setMaintenanceLoading(true);
@@ -314,25 +481,6 @@ function NodeDetailPanel({
             </dl>
           </div>
 
-          {/* Capabilities */}
-          {Object.keys(node.capabilities).length > 0 && (
-            <div>
-              <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                Capabilities
-              </h3>
-              <div className="flex flex-wrap gap-1.5">
-                {Object.entries(node.capabilities).map(([key, val]) => (
-                  <span
-                    key={key}
-                    className="inline-flex items-center rounded-md bg-muted px-2 py-0.5 text-xs font-medium"
-                  >
-                    {key}{val !== true && val !== undefined ? `: ${String(val)}` : ""}
-                  </span>
-                ))}
-              </div>
-            </div>
-          )}
-
           {/* Tags */}
           {node.tags.length > 0 && (
             <div>
@@ -357,6 +505,17 @@ function NodeDetailPanel({
             <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
               Actions
             </h3>
+
+            {isAdmin && node.status === "offline" && (
+              <button
+                type="button"
+                onClick={() => setReconnectOpen(true)}
+                className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors"
+              >
+                <Power className="h-4 w-4" />
+                Bring Online
+              </button>
+            )}
 
             <button
               type="button"
@@ -391,6 +550,14 @@ function NodeDetailPanel({
           hostname={node.hostname}
           onConfirm={handleDelete}
           onCancel={() => setDeleteTarget(null)}
+        />
+      )}
+
+      {reconnectOpen && (
+        <ReconnectDialog
+          node={node}
+          onClose={() => setReconnectOpen(false)}
+          onDone={onRefresh}
         />
       )}
     </>
@@ -440,55 +607,93 @@ function RegisterNodeDialog({
   onCreated: () => void;
   onClose: () => void;
 }) {
+  const [setupSsh, setSetupSsh] = useState(true); // default: provision over SSH
   const [name, setName] = useState("");
-  const [osType, setOsType] = useState<OSType>("linux");
   const [tags, setTags] = useState("");
+  const [osType, setOsType] = useState<OSType>("linux"); // register-only mode
+
+  // SSH provisioning fields
+  const [sshHost, setSshHost] = useState("");
+  const [sshUser, setSshUser] = useState("");
+  const [sshPassword, setSshPassword] = useState("");
+  const [useServerKey, setUseServerKey] = useState(false);
+  const [service, setService] = useState(false);
+  const [installPython, setInstallPython] = useState(true);
+
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<(NodeInfo & { api_key: string }) | null>(null);
+  const [errorLog, setErrorLog] = useState<string[]>([]);
+  const [result, setResult] = useState<
+    (NodeInfo & { api_key: string; ws_url?: string; mode?: string; online?: boolean; log?: string[] }) | null
+  >(null);
+  const [provisioned, setProvisioned] = useState(false);
+
+  const tagList = () => tags.split(",").map((t) => t.trim()).filter(Boolean);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setSubmitting(true);
     setError(null);
+    setErrorLog([]);
     try {
-      const tagList = tags.split(",").map((t) => t.trim()).filter(Boolean);
-      // Hardware fields are placeholders — the agent reports its real specs on
-      // connect. Only display_name (+ tags) persist as entered.
-      const created = await api.createNode({
-        hostname: name.trim() || "pending",
-        display_name: name.trim() || undefined,
-        os_type: osType,
-        os_version: "unknown",
-        arch: "unknown",
-        cpu_model: "pending",
-        cpu_cores: 1,
-        ram_mb: 1024,
-        agent_version: "0.1.0",
-        ip_address: "0.0.0.0",
-        capabilities: {},
-        tags: tagList,
-      });
-      setResult(created);
-      onCreated(); // refresh the table behind the modal
+      if (setupSsh) {
+        const res = await api.provisionNode({
+          ssh_host: sshHost.trim(),
+          ssh_user: sshUser.trim(),
+          ssh_password: useServerKey ? undefined : sshPassword,
+          use_server_key: useServerKey,
+          display_name: name.trim() || undefined,
+          tags: tagList(),
+          service,
+          install_python: installPython,
+        });
+        setResult(res);
+        setProvisioned(true);
+        onCreated();
+      } else {
+        // Register only — hardware fields are placeholders; the agent reports
+        // its real specs on connect. Only display_name (+ tags) persist.
+        const created = await api.createNode({
+          hostname: name.trim() || "pending",
+          display_name: name.trim() || undefined,
+          os_type: osType,
+          os_version: "unknown",
+          arch: "unknown",
+          cpu_model: "pending",
+          cpu_cores: 1,
+          ram_mb: 1024,
+          agent_version: "0.1.0",
+          ip_address: "0.0.0.0",
+          capabilities: {},
+          tags: tagList(),
+        });
+        setResult(created);
+        setProvisioned(false);
+        onCreated();
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to register node");
+      setError(err instanceof Error ? err.message : "Failed");
+      setErrorLog(((err as Error & { log?: string[] }).log) || []);
     } finally {
       setSubmitting(false);
     }
   };
 
   const wsHost = window.location.hostname || "localhost";
-  const serverUrl = result ? `ws://${wsHost}:8000/ws/agent/${result.id}` : "";
   const runCmd = result
-    ? `nexus-agent run --server ${serverUrl} --api-key ${result.api_key} --node-id ${result.id}`
+    ? `nexus-agent run --server ws://${wsHost}:8000/ws/agent/${result.id} --api-key ${result.api_key} --node-id ${result.id}`
     : "";
+
+  const sshIncomplete = !sshHost.trim() || !sshUser.trim() || (!useServerKey && !sshPassword);
+  const title = result
+    ? (provisioned ? "Node Set Up" : "Node Registered")
+    : "Add Node";
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-      <div className="w-full max-w-lg rounded-xl border border-border bg-background p-6 shadow-xl">
+      <div className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-xl border border-border bg-background p-6 shadow-xl">
         <div className="flex items-center justify-between">
-          <h3 className="text-lg font-semibold">{result ? "Node Registered" : "Register Node"}</h3>
+          <h3 className="text-lg font-semibold">{title}</h3>
           <button
             type="button"
             onClick={onClose}
@@ -500,58 +705,140 @@ function RegisterNodeDialog({
 
         {!result ? (
           <form onSubmit={handleSubmit} className="mt-4 space-y-4">
+            {/* Mode toggle */}
+            <label className="flex cursor-pointer items-start gap-3 rounded-lg border border-border p-3">
+              <input
+                type="checkbox"
+                checked={setupSsh}
+                onChange={(e) => setSetupSsh(e.target.checked)}
+                className="mt-0.5 h-4 w-4"
+              />
+              <span className="text-sm">
+                <span className="font-medium">Set up the device over SSH</span>
+                <span className="block text-xs text-muted-foreground">
+                  The server connects to the device, clones the agent from GitHub, installs and
+                  starts it. Uncheck to just register and get the run command.
+                </span>
+              </span>
+            </label>
+
             <div>
               <label htmlFor="node-name" className="mb-1.5 block text-sm font-medium">
-                Display Name
+                Display Name <span className="font-normal text-muted-foreground">(optional)</span>
               </label>
               <input
                 id="node-name"
                 type="text"
                 value={name}
                 onChange={(e) => setName(e.target.value)}
-                placeholder="e.g. lab-box-1"
+                placeholder={setupSsh ? "defaults to the host" : "e.g. lab-box-1"}
                 className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
                 autoFocus
               />
             </div>
 
-            <div>
-              <label htmlFor="node-os" className="mb-1.5 block text-sm font-medium">
-                OS (provisional)
-              </label>
-              <select
-                id="node-os"
-                value={osType}
-                onChange={(e) => setOsType(e.target.value as OSType)}
-                className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-              >
-                <option value="linux">Linux</option>
-                <option value="macos">macOS</option>
-                <option value="windows">Windows</option>
-              </select>
-              <p className="mt-1 text-xs text-muted-foreground">
-                The agent reports real specs on connect — this is just the label until then.
-              </p>
-            </div>
+            {setupSsh ? (
+              <>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label htmlFor="ssh-host" className="mb-1.5 block text-sm font-medium">SSH host / IP</label>
+                    <input
+                      id="ssh-host" type="text" value={sshHost}
+                      onChange={(e) => setSshHost(e.target.value)}
+                      placeholder="192.168.1.50"
+                      className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="ssh-user" className="mb-1.5 block text-sm font-medium">SSH user</label>
+                    <input
+                      id="ssh-user" type="text" value={sshUser}
+                      onChange={(e) => setSshUser(e.target.value)}
+                      placeholder="ubuntu"
+                      className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+                    />
+                  </div>
+                </div>
+
+                <label className="flex cursor-pointer items-center gap-2 text-sm">
+                  <input
+                    type="checkbox" checked={useServerKey}
+                    onChange={(e) => setUseServerKey(e.target.checked)}
+                    className="h-4 w-4"
+                  />
+                  Use the server's SSH key / agent (no password)
+                </label>
+
+                {!useServerKey && (
+                  <div>
+                    <label htmlFor="ssh-pass" className="mb-1.5 block text-sm font-medium">SSH password</label>
+                    <input
+                      id="ssh-pass" type="password" value={sshPassword}
+                      onChange={(e) => setSshPassword(e.target.value)}
+                      placeholder="••••••••"
+                      autoComplete="new-password"
+                      className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+                    />
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      Sent to the Nexus server to open the SSH session; not stored.
+                    </p>
+                  </div>
+                )}
+
+                <div className="space-y-2 rounded-lg border border-border p-3">
+                  <label className="flex cursor-pointer items-center gap-2 text-sm">
+                    <input type="checkbox" checked={service} onChange={(e) => setService(e.target.checked)} className="h-4 w-4" />
+                    Auto-start on boot (install a service)
+                    <span className="text-xs text-muted-foreground">— otherwise runs in the background</span>
+                  </label>
+                  <label className="flex cursor-pointer items-center gap-2 text-sm">
+                    <input type="checkbox" checked={installPython} onChange={(e) => setInstallPython(e.target.checked)} className="h-4 w-4" />
+                    Install Python 3.12 via Homebrew if missing
+                  </label>
+                </div>
+              </>
+            ) : (
+              <div>
+                <label htmlFor="node-os" className="mb-1.5 block text-sm font-medium">OS (provisional)</label>
+                <select
+                  id="node-os" value={osType}
+                  onChange={(e) => setOsType(e.target.value as OSType)}
+                  className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                >
+                  <option value="linux">Linux</option>
+                  <option value="macos">macOS</option>
+                  <option value="windows">Windows</option>
+                </select>
+              </div>
+            )}
 
             <div>
               <label htmlFor="node-tags" className="mb-1.5 block text-sm font-medium">
                 Tags <span className="font-normal text-muted-foreground">(optional, comma-separated)</span>
               </label>
               <input
-                id="node-tags"
-                type="text"
-                value={tags}
+                id="node-tags" type="text" value={tags}
                 onChange={(e) => setTags(e.target.value)}
                 placeholder="e.g. gpu, builder"
                 className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
               />
             </div>
 
-            {error && (
-              <p className="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-600 dark:bg-red-950 dark:text-red-400">
-                {error}
+            {submitting && setupSsh && (
+              <p className="rounded-lg bg-muted px-3 py-2 text-xs text-muted-foreground">
+                Setting up over SSH — this can take a minute (longer if Python must be installed).
               </p>
+            )}
+
+            {error && (
+              <div className="rounded-lg bg-red-50 px-3 py-2 dark:bg-red-950">
+                <p className="text-sm text-red-600 dark:text-red-400">{error}</p>
+                {errorLog.length > 0 && (
+                  <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap text-xs text-red-700/80 dark:text-red-400/80">
+                    {errorLog.join("\n")}
+                  </pre>
+                )}
+              </div>
             )}
 
             <div className="flex justify-end gap-3 pt-2">
@@ -564,14 +851,50 @@ function RegisterNodeDialog({
               </button>
               <button
                 type="submit"
-                disabled={submitting}
+                disabled={submitting || (setupSsh && sshIncomplete)}
                 className="inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50"
               >
                 {submitting && <Loader2 className="h-4 w-4 animate-spin" />}
-                Register Node
+                {setupSsh ? "Set Up Node" : "Register Node"}
               </button>
             </div>
           </form>
+        ) : provisioned ? (
+          <div className="mt-4 space-y-4">
+            {result.online ? (
+              <p className="rounded-lg bg-green-50 px-3 py-2 text-sm text-green-700 dark:bg-green-950/50 dark:text-green-400">
+                <span className="font-medium">{result.display_name || result.hostname}</span> was set up
+                over SSH and is <span className="font-medium">online</span>
+                {result.mode === "service" ? " (auto-start service)" : " (background)"}.
+              </p>
+            ) : (
+              <p className="rounded-lg bg-yellow-50 px-3 py-2 text-sm text-yellow-700 dark:bg-yellow-950/50 dark:text-yellow-400">
+                <span className="font-medium">{result.display_name || result.hostname}</span> was installed
+                and started, but the agent <span className="font-medium">hasn't connected back yet</span>.
+                The device can reach the server over HTTP but the WebSocket isn't completing — usually a
+                VPN/firewall or asymmetric routing between server and device. It keeps retrying; see the log.
+              </p>
+            )}
+            {result.log && result.log.length > 0 && (
+              <div>
+                <div className="mb-1.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                  Setup log
+                </div>
+                <pre className="max-h-56 overflow-auto whitespace-pre-wrap rounded-lg border border-border bg-muted px-3 py-2 text-xs">
+                  {result.log.join("\n")}
+                </pre>
+              </div>
+            )}
+            <div className="flex justify-end pt-2">
+              <button
+                type="button"
+                onClick={onClose}
+                className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors"
+              >
+                Done
+              </button>
+            </div>
+          </div>
         ) : (
           <div className="mt-4 space-y-4">
             <p className="text-sm text-muted-foreground">
@@ -597,9 +920,7 @@ function RegisterNodeDialog({
               <CopyRow value={runCmd} />
               <p className="mt-1.5 text-xs text-muted-foreground">
                 Server host defaults to <code className="font-mono">{wsHost}:8000</code> — change it if the
-                agent reaches this server at a different address. Install the agent first
-                (<code className="font-mono">pip install -e packages/agent</code>), or use{" "}
-                <code className="font-mono">./add_node.sh user@host</code> to do all of this remotely.
+                agent reaches this server at a different address.
               </p>
             </div>
 
@@ -678,7 +999,7 @@ export default function NodesPage() {
               className="inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors"
             >
               <Plus className="h-4 w-4" />
-              Register Node
+              Add Node
             </button>
           )}
         </div>

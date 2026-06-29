@@ -62,7 +62,6 @@ class CollectResultsStep(FlowStep):
     OUTPUT_KEYS = ["results_artifact_id"]
     DESCRIPTION = "Collect gem5 m5out results and store them as an artifact."
 
-    REQUIRED_CAPABILITIES = ["gem5"]
     SUPPORTED_OS = ["macos", "linux"]
     LARGE_OUTPUT = True
 

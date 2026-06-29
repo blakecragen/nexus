@@ -167,14 +167,6 @@ function PaletteItem({
         </div>
       )}
       <div className="flex flex-wrap gap-1 mt-1.5">
-        {schema.required_capabilities.map((cap) => (
-          <span
-            key={cap}
-            className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-indigo-50 text-indigo-600"
-          >
-            {cap}
-          </span>
-        ))}
         {schema.supported_os.map((os) => (
           <span
             key={os}
@@ -476,8 +468,7 @@ export default function JobBuilder() {
     return stepsStore.steps.filter(
       (s) =>
         s.name.toLowerCase().includes(q) ||
-        s.description.toLowerCase().includes(q) ||
-        s.required_capabilities.some((c) => c.toLowerCase().includes(q))
+        s.description.toLowerCase().includes(q)
     );
   }, [stepsStore.steps, search]);
 

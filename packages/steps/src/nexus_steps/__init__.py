@@ -21,6 +21,7 @@ _STEP_MODULES = [
     "nexus_steps.flow.jump",
     "nexus_steps.git.clone",
     "nexus_steps.git.pull",
+    "nexus_steps.docker.ensure_container",
     "nexus_steps.gem5.run_simulation",
     "nexus_steps.gem5.collect_results",
     "nexus_steps.package.install",

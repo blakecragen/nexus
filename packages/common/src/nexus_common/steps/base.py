@@ -3,7 +3,7 @@ FlowStep ABC and supporting types for the Nexus step system.
 
 Adapted from HVE-Automation-Worker's step architecture with additions for:
 - OS-aware execution (OS_VARIANTS, SUPPORTED_OS)
-- Distributed node execution (REQUIRES_NODE, REQUIRED_CAPABILITIES)
+- Distributed node execution (REQUIRES_NODE)
 - Capability-based scheduling
 
 Steps are plain Python classes with zero framework dependencies, making them
@@ -175,7 +175,6 @@ class FlowStep(ABC):
     - OS_VARIANTS: OS-specific parameter defaults merged before execution
     - SUPPORTED_OS: Which operating systems can execute this step
     - REQUIRES_NODE: Whether step needs a compute node (False for flow/control steps)
-    - REQUIRED_CAPABILITIES: Node capabilities needed (e.g., ["gem5", "docker"])
     - LARGE_OUTPUT: Hint for storage manager to prefer high-capacity backends
 
     Lifecycle:
@@ -204,9 +203,6 @@ class FlowStep(ABC):
 
     REQUIRES_NODE: bool = True
     """If False, step runs on the control plane (e.g., sleep, jump)."""
-
-    REQUIRED_CAPABILITIES: list[str] = []
-    """Node capabilities needed to run this step (e.g., ['gem5'])."""
 
     SUPPORTED_OS: list[str] = ["macos", "linux", "windows"]
     """Which operating systems can execute this step."""
@@ -337,7 +333,6 @@ class FlowStep(ABC):
             "description": cls.DESCRIPTION,
             "requires_node": cls.REQUIRES_NODE,
             "supported_os": cls.SUPPORTED_OS,
-            "required_capabilities": cls.REQUIRED_CAPABILITIES,
             "output_keys": cls.OUTPUT_KEYS,
             "fields": fields,
             "rules": rules,

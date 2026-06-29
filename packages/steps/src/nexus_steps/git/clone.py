@@ -61,7 +61,6 @@ class GitCloneStep(FlowStep):
     PARAMS_SCHEMA = GitCloneParams
     OUTPUT_KEYS = ["clone_path", "commit_sha"]
     DESCRIPTION = "Clone a git repository with optional branch and depth."
-    REQUIRED_CAPABILITIES = ["git"]
 
     # ── Lifecycle ──
 

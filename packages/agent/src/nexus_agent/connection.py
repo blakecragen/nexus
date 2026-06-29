@@ -144,7 +144,6 @@ class AgentConnection:
             gpu_info=caps.get("gpu_info"),
             agent_version=__version__,
             ip_address=caps["ip_address"],
-            capabilities=caps.get("software", {}),
             tags=self.config.tags,
         )
         await self.send_message(msg.model_dump(mode="json"))

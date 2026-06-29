@@ -51,7 +51,6 @@ class GitPullStep(FlowStep):
     PARAMS_SCHEMA = GitPullParams
     OUTPUT_KEYS = ["commit_sha", "updated"]
     DESCRIPTION = "Pull latest changes from a remote into a local repository."
-    REQUIRED_CAPABILITIES = ["git"]
 
     # ── Lifecycle ──
 

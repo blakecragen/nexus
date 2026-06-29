@@ -5,6 +5,7 @@ from __future__ import annotations
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, status
+from fastapi.responses import PlainTextResponse
 
 from nexus_common.models.schemas import JobDetail, JobInfo, JobSubmit, StepRunInfo
 from nexus_common.steps.registry import STEP_REGISTRY
@@ -99,7 +100,25 @@ async def get_job(job_id: UUID, db: DbSession, user: CurrentUser):
         job=_job_to_info(job),
         steps=[_step_run_to_info(sr) for sr in step_runs],
         context_data=job.context_data or {},
+        has_log=bool(job.log_text),
     )
+
+
+@router.get("/{job_id}/log")
+async def get_job_log(job_id: UUID, db: DbSession, user: CurrentUser, download: bool = False):
+    """Return the aggregated per-job terminal log as plain text.
+
+    With ?download=1 the response is sent as an attachment .txt file.
+    """
+    job = await ops.get_job_by_id(db, job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    body = job.log_text or "No terminal output captured yet.\n"
+    headers = (
+        {"Content-Disposition": f'attachment; filename="job_{job_id}.txt"'}
+        if download else None
+    )
+    return PlainTextResponse(body, headers=headers)
 
 
 @router.post("/{job_id}/cancel", response_model=JobInfo)

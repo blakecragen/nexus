@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
-"""nexus_deploy.py — register a Nexus node and deploy + launch the agent on a
-remote host over SSH, so it appears online in the dashboard.
+"""nexus_deploy.py — register a Nexus node and set it up entirely over SSH.
+
+The device CLONES the agent code from GitHub, installs it into a venv, saves its
+config, and starts the agent. Background by default; --service installs an
+auto-start service (launchd on macOS, systemd --user on Linux).
 
 Uses paramiko (pure-socket SSH, no pseudo-terminal), so password auth works
 non-interactively — including from sandboxes that block sshpass/expect.
@@ -8,6 +11,7 @@ non-interactively — including from sandboxes that block sshpass/expect.
 USAGE
   ./add_node.sh user@host [password] [options]
   ./add_node.sh user@host --register-only --name lab-1
+  ./add_node.sh user@host --service             # auto-start on boot
   ./add_node.sh user@host --key                 # SSH key auth instead of password
 
 AUTH
@@ -17,12 +21,16 @@ AUTH
 OPTIONS
   --name NAME         Friendly display name in the dashboard (default: host).
   --register-only     Just mint the node (UUID + api_key); no SSH/deploy.
+  --service           Install an auto-start service instead of a background process.
   --key               Use SSH key/agent auth instead of a password.
+  --repo-url URL      Git repo to clone on the device.
+                      Default: https://github.com/blakecragen/nexus.git (or $NEXUS_REPO_URL).
+  --branch NAME       Branch to clone. Default: main (or $NEXUS_BRANCH).
   --ws-host IP        Host the REMOTE agent dials back to (this server).
                       Default: auto-detected LAN IP (or $NEXUS_WS_HOST).
   --ws-port PORT      Default: 8000.
   --api URL           Nexus API base for registration. Default: http://localhost:8000.
-  --remote-dir DIR    Install dir on the remote (default: nexus-agent-deploy, in $HOME).
+  --remote-dir DIR    Clone/install dir on the remote (default: nexus, in $HOME).
   --remote-python BIN Force a remote Python interpreter (must be >=3.11).
   --install-python    If no Python >=3.11 is found, `brew install python@3.12`.
 """
@@ -32,7 +40,6 @@ import argparse
 import getpass
 import json
 import os
-import subprocess
 import sys
 import tempfile
 import time
@@ -72,7 +79,7 @@ def api_register(api, token, hostname, name):
         "hostname": hostname, "display_name": name, "os_type": "linux",
         "os_version": "unknown", "arch": "unknown", "cpu_model": "pending",
         "cpu_cores": 1, "ram_mb": 1024, "agent_version": "0.1.0",
-        "ip_address": "0.0.0.0", "capabilities": {}, "tags": [],
+        "ip_address": "0.0.0.0", "tags": [],
     }
     st, b = _req("POST", f"{api}/api/nodes", token=token, body=body)
     if st != 201 or not b:
@@ -96,39 +103,129 @@ done
 exit 1
 '''
 
+# Args: PY RD REPO_URL BRANCH WS KEY NID MODE
 INSTALL_SH = r'''#!/bin/bash
 set -e
-PY="$1"; RD="$2"; WS="$3"; KEY="$4"; NID="$5"
-mkdir -p "$RD"
-tar -xzf /tmp/nexus-agent-deploy.tgz -C "$RD"
+PY="$1"; RD="$2"; REPO_URL="$3"; BRANCH="$4"; WS="$5"; KEY="$6"; NID="$7"; MODE="$8"
+
+command -v git >/dev/null 2>&1 || { echo "NO_GIT"; exit 3; }
+
+# ── fetch code from GitHub (clone fresh, or update an existing checkout) ──
+if [ -d "$RD/.git" ]; then
+  git -C "$RD" remote set-url origin "$REPO_URL" 2>/dev/null || true
+  git -C "$RD" fetch --depth 1 origin "$BRANCH"
+  git -C "$RD" checkout -q -B "$BRANCH" "origin/$BRANCH"
+else
+  rm -rf "$RD"
+  git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$RD"
+fi
 cd "$RD"
+RD="$(pwd)"   # make absolute, so $RD/... paths are correct after cd
+
+# ── venv + install the agent ──
 "$PY" -m venv .venv
 ./.venv/bin/python -m pip install -q --upgrade pip
 ./.venv/bin/python -m pip install -q -e packages/common
 ./.venv/bin/python -m pip install -q -e packages/steps
 ./.venv/bin/python -m pip install -q -e packages/agent
+AGENT="$(pwd)/.venv/bin/nexus-agent"
+
+# ── persist config (api_key stored 0600 in ~/.nexus-agent/config.json) ──
+"$AGENT" init --server "$WS" --api-key "$KEY" --node-id "$NID" >/dev/null
+
+# ── control helper, so the agent can be managed over SSH ──
+cat > "$RD/nexusctl" <<'CTL'
+#!/bin/bash
+# Control the Nexus agent (background mode). Config is in ~/.nexus-agent/config.json
+cd "$(dirname "$0")" || exit 1
+AG=./.venv/bin/nexus-agent
+_start(){ nohup $AG run </dev/null >agent.log 2>&1 & echo $! > agent.pid; echo "started $(cat agent.pid)"; }
+_stop(){ [ -f agent.pid ] && kill "$(cat agent.pid)" 2>/dev/null && echo stopped || echo "not running"; }
+_status(){ [ -f agent.pid ] && kill -0 "$(cat agent.pid)" 2>/dev/null && echo "running $(cat agent.pid)" || echo stopped; }
+case "$1" in
+  start)   _start;;
+  stop)    _stop;;
+  restart) _stop; sleep 1; _start;;
+  status)  _status;;
+  logs)    tail -n 40 agent.log;;
+  *)       echo "usage: nexusctl {start|stop|restart|status|logs}";;
+esac
+CTL
+chmod +x "$RD/nexusctl"
+
+# ── stop any prior instance (background pid AND any installed service) ──
 if [ -f agent.pid ] && kill -0 "$(cat agent.pid)" 2>/dev/null; then kill "$(cat agent.pid)" 2>/dev/null || true; sleep 1; fi
-nohup ./.venv/bin/nexus-agent run --server "$WS" --api-key "$KEY" --node-id "$NID" </dev/null >agent.log 2>&1 &
-echo $! > agent.pid
-sleep 3
-if kill -0 "$(cat agent.pid)" 2>/dev/null; then
-  echo "AGENT_RUNNING $(cat agent.pid)"; tail -n 6 agent.log 2>/dev/null || true
+launchctl bootout "gui/$(id -u)/com.nexus.agent" 2>/dev/null || true
+systemctl --user disable --now nexus-agent 2>/dev/null || true
+
+if [ "$MODE" = "service" ]; then
+  OS="$(uname -s)"
+  if [ "$OS" = "Darwin" ]; then
+    PLIST="$HOME/Library/LaunchAgents/com.nexus.agent.plist"
+    mkdir -p "$HOME/Library/LaunchAgents"
+    cat > "$PLIST" <<PL
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.nexus.agent</string>
+  <key>ProgramArguments</key><array><string>$AGENT</string><string>run</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$RD/agent.log</string>
+  <key>StandardErrorPath</key><string>$RD/agent.log</string>
+</dict></plist>
+PL
+    launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null || launchctl load -w "$PLIST" 2>/dev/null || true
+    launchctl kickstart -k "gui/$(id -u)/com.nexus.agent" 2>/dev/null || true
+    echo "SERVICE_INSTALLED launchd com.nexus.agent"
+  elif [ "$OS" = "Linux" ]; then
+    UD="$HOME/.config/systemd/user"; mkdir -p "$UD"
+    cat > "$UD/nexus-agent.service" <<UNIT
+[Unit]
+Description=Nexus Agent
+After=network-online.target
+[Service]
+ExecStart=$AGENT run
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=default.target
+UNIT
+    command -v loginctl >/dev/null 2>&1 && loginctl enable-linger "$(id -un)" 2>/dev/null || true
+    systemctl --user daemon-reload
+    systemctl --user enable --now nexus-agent
+    echo "SERVICE_INSTALLED systemd nexus-agent"
+  else
+    echo "SERVICE_UNSUPPORTED $OS"; exit 6
+  fi
+  sleep 3
 else
-  echo "AGENT_DIED"; tail -n 25 agent.log 2>/dev/null || true; exit 5
+  # ── background (default) ──
+  "$RD/nexusctl" start >/dev/null
+  sleep 3
+  if "$RD/nexusctl" status | grep -q running; then
+    echo "AGENT_RUNNING $(cat agent.pid)"; tail -n 6 agent.log 2>/dev/null || true
+  else
+    echo "AGENT_DIED"; tail -n 25 agent.log 2>/dev/null || true; exit 5
+  fi
 fi
 '''
 
 def main():
-    ap = argparse.ArgumentParser(add_help=True, description="Register + deploy a Nexus node.")
+    ap = argparse.ArgumentParser(add_help=True, description="Register + set up a Nexus node over SSH.")
     ap.add_argument("target", help="user@host")
     ap.add_argument("password", nargs="?", default=None, help="SSH password (optional)")
     ap.add_argument("--name", default=None)
     ap.add_argument("--register-only", action="store_true")
+    ap.add_argument("--service", action="store_true",
+                    help="install an auto-start service (launchd/systemd) instead of a background process")
     ap.add_argument("--key", action="store_true", help="use SSH key auth")
+    ap.add_argument("--repo-url", default=os.environ.get("NEXUS_REPO_URL", "https://github.com/blakecragen/nexus.git"))
+    ap.add_argument("--branch", default=os.environ.get("NEXUS_BRANCH", "main"))
     ap.add_argument("--ws-host", default=os.environ.get("NEXUS_WS_HOST"))
     ap.add_argument("--ws-port", default=os.environ.get("NEXUS_WS_PORT", "8000"))
     ap.add_argument("--api", default=os.environ.get("NEXUS_API", "http://localhost:8000"))
-    ap.add_argument("--remote-dir", default="nexus-agent-deploy")
+    ap.add_argument("--remote-dir", default="nexus")
     ap.add_argument("--remote-python", default=None)
     ap.add_argument("--install-python", action="store_true")
     ap.add_argument("--admin-user", default=os.environ.get("NEXUS_ADMIN_USER", "admin"))
@@ -139,28 +236,28 @@ def main():
         die("Target must be user@host.")
     user, host = args.target.split("@", 1)
     name = args.name or host
-    repo = os.path.dirname(os.path.abspath(__file__))
-    args.ws_host = args.ws_host or _default_ws_host()
+    rd = args.remote_dir
 
-    # 1. Authenticate + register (mints UUID + api_key)
-    info(f"Logging in to {args.api} as '{args.admin_user}'")
-    token = api_login(args.api, args.admin_user, args.admin_pass)
-    ok("Authenticated.")
-    info(f"Registering node '{name}'")
-    node_id, api_key = api_register(args.api, token, host, name)
-    ws_url = f"ws://{args.ws_host}:{args.ws_port}/ws/agent/{node_id}"
-    ok("Registered node.")
-    print(f"    NODE_ID  {node_id}")
-    print(f"    API_KEY  {api_key}")
-    print(f"    WS_URL   {ws_url}")
-
+    # ── register-only: HTTP-only path, no SSH ──
     if args.register_only:
+        ws_host = args.ws_host or _default_ws_host()
+        info(f"Logging in to {args.api} as '{args.admin_user}'")
+        token = api_login(args.api, args.admin_user, args.admin_pass)
+        ok("Authenticated.")
+        info(f"Registering node '{name}'")
+        node_id, api_key = api_register(args.api, token, host, name)
+        ws_url = f"ws://{ws_host}:{args.ws_port}/ws/agent/{node_id}"
+        ok("Registered node.")
+        print(f"    NODE_ID  {node_id}")
+        print(f"    API_KEY  {api_key}")
+        print(f"    WS_URL   {ws_url}")
         print(f"\nRun the agent on the target to bring it online:\n"
               f"  nexus-agent run --server {ws_url} --api-key {api_key} --node-id {node_id}\n"
               f"Remove: curl -X DELETE {args.api}/api/nodes/{node_id} -H 'Authorization: Bearer <token>'")
         return
 
-    # 2. Connect (paramiko — no pty)
+    # ── SSH-first: connect + verify the device, THEN register. If SSH fails we
+    #    never created a node, so there's no orphan to clean up. ──
     try:
         import paramiko
     except ImportError:
@@ -185,7 +282,6 @@ def main():
             client.connect(host, username=user, password=pw, timeout=20,
                            look_for_keys=False, allow_agent=False)
     except Exception as e:
-        _cleanup(args.api, token, node_id)
         die(f"SSH connection failed: {type(e).__name__}: {e}")
     ok("Connected.")
 
@@ -194,18 +290,33 @@ def main():
         rc = out.channel.recv_exit_status()
         return rc, out.read().decode(), err.read().decode()
 
+    mode = "service" if args.service else "background"
+    token = node_id = api_key = None
     try:
-        # 3. Reachability back to the server
-        rc, o, _ = run(f"curl -s -o /dev/null -w '%{{http_code}}' --max-time 8 "
-                       f"http://{args.ws_host}:{args.ws_port}/api/nodes || echo 000")
-        code = (o or "").strip()
-        if code in ("", "000"):
-            warn(f"Remote cannot reach http://{args.ws_host}:{args.ws_port} — agent won't connect. "
-                 f"Check --ws-host / firewall.")
-        else:
-            ok(f"Remote reached the server (HTTP {code} — auth-protected, expected).")
+        # 1. Pick the controller address the REMOTE can actually reach (auto,
+        #    unless --ws-host was given). Handles multi-homed controllers.
+        candidates = [args.ws_host] if args.ws_host else (_local_ipv4s() or ["localhost"])
+        chosen = None
+        for cand in candidates:
+            rc, o, _ = run(f"curl -s -o /dev/null -w '%{{http_code}}' --max-time 5 "
+                           f"http://{cand}:{args.ws_port}/api/nodes")
+            c = (o or "").strip()
+            if c and c != "000":
+                chosen = cand
+                ok(f"Remote reaches the server at {cand}:{args.ws_port} (HTTP {c}).")
+                break
+        if not chosen:
+            chosen = args.ws_host or (candidates[0] if candidates else "localhost")
+            warn(f"Remote couldn't reach the server at any of {candidates} — using {chosen}. "
+                 f"Agent may not connect; re-run with --ws-host <reachable-address>.")
+        args.ws_host = chosen
 
-        # 4. Resolve a remote Python >=3.11
+        # 2. git present?
+        rc, _, _ = run("command -v git")
+        if rc != 0:
+            die("git not found on remote (macOS: `xcode-select --install`; Linux: apt/yum install git).")
+
+        # 3. Resolve a remote Python >=3.11
         py = args.remote_python
         if not py:
             rc, o, _ = run(f"bash -c {_q(RESOLVE_PY)}")
@@ -215,42 +326,46 @@ def main():
                 info("No Python >=3.11 found — installing python@3.12 via Homebrew (a few minutes)…")
                 brew = _first_path(run, ["/opt/homebrew/bin/brew", "/usr/local/bin/brew", "brew"])
                 if not brew:
-                    _cleanup(args.api, token, node_id); die("Homebrew not found on remote.")
+                    die("Homebrew not found on remote.")
                 rc, o, e = run(f"{brew} install python@3.12", timeout=1800)
                 if rc != 0:
-                    _cleanup(args.api, token, node_id); die(f"brew install failed:\n{e or o}")
+                    die(f"brew install failed:\n{e or o}")
                 rc, o, _ = run(f"bash -c {_q(RESOLVE_PY)}")
                 py = o.strip() if rc == 0 else ""
             if not py:
-                _cleanup(args.api, token, node_id)
                 die("No Python >=3.11 on remote. Re-run with --install-python (uses Homebrew), "
                     "or pass --remote-python /path/to/python3.x.")
         rc, o, _ = run(f"{py} --version")
         ok(f"Remote Python: {o.strip()}  ({py})")
 
-        # 5. Bundle + upload packages
-        info("Bundling + uploading agent packages")
-        tar_path = os.path.join(tempfile.gettempdir(), "nexus-agent-deploy.tgz")
-        subprocess.run(["tar", "-czf", tar_path, "-C", repo,
-                        "packages/common", "packages/steps", "packages/agent"], check=True)
+        # 4. Device checks out — register the node (mints UUID + api_key)
+        info(f"Logging in to {args.api} as '{args.admin_user}'")
+        token = api_login(args.api, args.admin_user, args.admin_pass)
+        ok("Authenticated.")
+        info(f"Registering node '{name}'")
+        node_id, api_key = api_register(args.api, token, host, name)
+        ws_url = f"ws://{args.ws_host}:{args.ws_port}/ws/agent/{node_id}"
+        ok("Registered node.")
+        print(f"    NODE_ID  {node_id}")
+        print(f"    API_KEY  {api_key}")
+        print(f"    WS_URL   {ws_url}")
+
+        # 5. Clone from GitHub + install + start (all on the device)
+        info(f"Cloning {args.repo_url}@{args.branch} on the device + installing ({mode})…")
         sftp = client.open_sftp()
-        sftp.put(tar_path, "/tmp/nexus-agent-deploy.tgz")
         with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as f:
             f.write(INSTALL_SH); local_sh = f.name
         sftp.put(local_sh, "/tmp/nexus-install.sh")
         sftp.close()
-        ok("Uploaded.")
-
-        # 6. Install + launch
-        info("Installing into a venv + launching agent (this can take a minute)")
-        rc, o, e = run(f"bash /tmp/nexus-install.sh {_q(py)} {_q(args.remote_dir)} "
-                       f"{_q(ws_url)} {_q(api_key)} {_q(node_id)}", timeout=900)
+        rc, o, e = run(f"bash /tmp/nexus-install.sh {_q(py)} {_q(rd)} {_q(args.repo_url)} "
+                       f"{_q(args.branch)} {_q(ws_url)} {_q(api_key)} {_q(node_id)} {_q(mode)}",
+                       timeout=1200)
         print("    " + "\n    ".join((o or "").strip().splitlines()))
         if rc != 0:
             warn((e or "").strip())
             _cleanup(args.api, token, node_id)
-            die("Remote install/launch failed (node deregistered).")
-        ok("Agent launched on remote.")
+            die("Remote setup failed (node deregistered).")
+        ok(f"Agent installed + started on remote ({mode}).")
     finally:
         client.close()
 
@@ -267,11 +382,24 @@ def main():
         ok(f"Node '{name}' is ONLINE. View it at http://localhost:3000 (Nodes).")
     else:
         warn(f"Node status is '{status}' (not online yet). Check the remote log:")
-        warn(f"  ssh {args.target} 'tail -f {args.remote_dir}/agent.log'")
-    print(f"\nManage:\n"
-          f"  Logs:   ssh {args.target} 'tail -f {args.remote_dir}/agent.log'\n"
-          f"  Stop:   ssh {args.target} 'kill $(cat {args.remote_dir}/agent.pid)'\n"
-          f"  Remove: curl -X DELETE {args.api}/api/nodes/{node_id} -H 'Authorization: Bearer <token>'")
+        warn(f"  ssh {args.target} 'tail -f {rd}/agent.log'")
+        if args.service:
+            warn("launchd user services need an active login (GUI) session on the Mac to start; "
+                 "they'll come up at next login if the box is currently headless.")
+
+    # 8. Management hints
+    if args.service:
+        print(f"\nService (auto-starts on boot, restarts on crash):\n"
+              f"  Logs:    ssh {args.target} 'tail -f {rd}/agent.log'\n"
+              f"  Status:  ssh {args.target} 'launchctl print gui/$(id -u)/com.nexus.agent 2>/dev/null || systemctl --user status nexus-agent'\n"
+              f"  Stop:    ssh {args.target} 'launchctl bootout gui/$(id -u)/com.nexus.agent 2>/dev/null || systemctl --user disable --now nexus-agent'\n"
+              f"  Remove:  curl -X DELETE {args.api}/api/nodes/{node_id} -H 'Authorization: Bearer <token>'")
+    else:
+        print(f"\nBackground (config saved; manage over SSH with nexusctl):\n"
+              f"  Restart: ssh {args.target} '{rd}/nexusctl restart'\n"
+              f"  Status:  ssh {args.target} '{rd}/nexusctl status'\n"
+              f"  Logs:    ssh {args.target} '{rd}/nexusctl logs'\n"
+              f"  Remove:  curl -X DELETE {args.api}/api/nodes/{node_id} -H 'Authorization: Bearer <token>'")
 
 def _q(s):
     """Single-quote a string for safe shell embedding."""
@@ -288,6 +416,27 @@ def _default_ws_host():
         return ip
     except Exception:
         return "localhost"
+
+def _local_ipv4s():
+    """All controller IPv4 addresses, default-route first — candidates for the
+    address the remote agent should dial back to."""
+    import socket, subprocess, re
+    ips = []
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80)); ips.append(s.getsockname()[0]); s.close()
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(["ifconfig"], capture_output=True, text=True, timeout=5).stdout
+        if not out:
+            out = subprocess.run(["ip", "-4", "addr"], capture_output=True, text=True, timeout=5).stdout
+        for ip in re.findall(r"inet (?:addr:)?(\d+\.\d+\.\d+\.\d+)", out):
+            if ip not in ips:
+                ips.append(ip)
+    except Exception:
+        pass
+    return [ip for ip in ips if not ip.startswith(("127.", "169.254."))]
 
 def _first_path(run, candidates):
     for c in candidates:

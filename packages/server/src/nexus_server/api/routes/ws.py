@@ -163,7 +163,7 @@ async def _handle_agent_message(
             hostname=reg.hostname, os_type=reg.os_type, os_version=reg.os_version,
             arch=reg.arch, cpu_model=reg.cpu_model, cpu_cores=reg.cpu_cores,
             ram_mb=reg.ram_mb, gpu_info=reg.gpu_info, agent_version=reg.agent_version,
-            ip_address=reg.ip_address, capabilities=reg.capabilities, tags=reg.tags,
+            ip_address=reg.ip_address, tags=reg.tags,
         )
         await ws.send_json(ServerAck(message="registered").model_dump(mode="json"))
 
@@ -192,7 +192,11 @@ async def _handle_agent_message(
         # Notify the runner; it owns the DB writes for terminal state +
         # context merging + step advancement.
         runner = ws.app.state.runner
-        runner.on_step_completed(info.job_id, info.step_index, info.outputs)
+        runner.on_step_completed(
+            info.job_id, info.step_index, info.outputs,
+            command=info.command, stdout=info.stdout, stderr=info.stderr,
+            exit_code=info.exit_code,
+        )
         await manager.broadcast_to_dashboards(
             DashboardJobStatus(
                 job_id=info.job_id, status="running", current_step=info.step_index,
@@ -202,7 +206,11 @@ async def _handle_agent_message(
     elif msg_type == "step.failed":
         info = StepFailed(**data)
         runner = ws.app.state.runner
-        runner.on_step_failed(info.job_id, info.step_index, info.error)
+        runner.on_step_failed(
+            info.job_id, info.step_index, info.error,
+            command=info.command, stdout=info.stdout, stderr=info.stderr,
+            exit_code=info.exit_code,
+        )
         await manager.broadcast_to_dashboards(
             DashboardJobStatus(
                 job_id=info.job_id, status="failed", current_step=info.step_index,

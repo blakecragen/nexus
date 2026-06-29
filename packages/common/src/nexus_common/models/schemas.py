@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Annotated
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PlainSerializer
 
 from nexus_common.models.enums import (
     CredentialType,
@@ -16,6 +17,19 @@ from nexus_common.models.enums import (
     TransferStatus,
     UserRole,
 )
+
+
+def _iso_utc(dt: datetime) -> str:
+    """Serialize a datetime as timezone-aware ISO 8601. Naive values are assumed
+    to be UTC (SQLite returns naive datetimes), so clients never misread them as
+    local time."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.isoformat()
+
+
+# Use in place of bare `datetime` for any field serialized to clients.
+UTCDateTime = Annotated[datetime, PlainSerializer(_iso_utc, return_type=str, when_used="json")]
 
 
 # ── Auth ────────────────────────────────────────────────────────────────
@@ -53,7 +67,6 @@ class NodeRegistration(BaseModel):
     gpu_info: str | None = None
     agent_version: str
     ip_address: str
-    capabilities: dict = Field(default_factory=dict)
     tags: list[str] = Field(default_factory=list)
 
 
@@ -71,10 +84,9 @@ class NodeInfo(BaseModel):
     agent_version: str
     ip_address: str
     status: NodeStatus
-    capabilities: dict
     tags: list[str]
-    last_heartbeat: datetime | None = None
-    registered_at: datetime
+    last_heartbeat: UTCDateTime | None = None
+    registered_at: UTCDateTime
 
 
 # ── Pools ───────────────────────────────────────────────────────────────
@@ -89,7 +101,7 @@ class PoolInfo(BaseModel):
     name: str
     description: str | None = None
     node_count: int = 0
-    created_at: datetime
+    created_at: UTCDateTime
 
 
 # ── Jobs ────────────────────────────────────────────────────────────────
@@ -122,9 +134,9 @@ class JobInfo(BaseModel):
     status: JobStatus
     current_step: int
     error: str | None = None
-    created_at: datetime
-    started_at: datetime | None = None
-    completed_at: datetime | None = None
+    created_at: UTCDateTime
+    started_at: UTCDateTime | None = None
+    completed_at: UTCDateTime | None = None
 
 
 class StepRunInfo(BaseModel):
@@ -137,14 +149,15 @@ class StepRunInfo(BaseModel):
     input_params: dict | None = None
     output_params: dict | None = None
     error: str | None = None
-    started_at: datetime | None = None
-    finished_at: datetime | None = None
+    started_at: UTCDateTime | None = None
+    finished_at: UTCDateTime | None = None
 
 
 class JobDetail(BaseModel):
     job: JobInfo
     steps: list[StepRunInfo]
     context_data: dict = Field(default_factory=dict)
+    has_log: bool = False
 
 
 # ── Steps Schema ────────────────────────────────────────────────────────
@@ -169,7 +182,6 @@ class StepSchemaInfo(BaseModel):
     description: str
     requires_node: bool
     supported_os: list[str]
-    required_capabilities: list[str]
     output_keys: list[str]
     fields: list[FieldSchema]
     rules: list[InputRuleSchema]
@@ -194,8 +206,8 @@ class CredentialInfo(BaseModel):
     description: str | None = None
     is_shared: bool
     owner_id: UUID
-    created_at: datetime
-    updated_at: datetime | None = None
+    created_at: UTCDateTime
+    updated_at: UTCDateTime | None = None
 
 
 class CredentialTypeInfo(BaseModel):
@@ -228,7 +240,7 @@ class StorageBackendInfo(BaseModel):
     is_default: bool
     is_active: bool
     priority: int
-    created_at: datetime
+    created_at: UTCDateTime
 
 
 class TransferRequest(BaseModel):
@@ -245,8 +257,8 @@ class TransferInfo(BaseModel):
     status: TransferStatus
     bytes_transferred: int = 0
     error: str | None = None
-    started_at: datetime | None = None
-    completed_at: datetime | None = None
+    started_at: UTCDateTime | None = None
+    completed_at: UTCDateTime | None = None
 
 
 # ── Artifacts ───────────────────────────────────────────────────────────
@@ -261,7 +273,7 @@ class ArtifactInfo(BaseModel):
     storage_key: str
     content_type: str | None = None
     size_bytes: int
-    created_at: datetime
+    created_at: UTCDateTime
 
 
 # ── Templates ───────────────────────────────────────────────────────────
@@ -278,4 +290,4 @@ class TemplateInfo(BaseModel):
     description: str | None = None
     steps: list[StepConfig]
     created_by: UUID
-    created_at: datetime
+    created_at: UTCDateTime

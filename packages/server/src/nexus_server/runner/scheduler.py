@@ -25,8 +25,10 @@ async def find_node_for_step(
     2. If target_pool_id is specified, find a matching node in the pool
     3. Otherwise, find any matching online node
 
-    Matching considers: node status, OS support, required capabilities, and
-    an optional target_os override (per-step pin to a specific OS family).
+    Matching considers: node status, OS support, and an optional target_os
+    override (per-step pin to a specific OS family). Whether the node actually
+    has the required software (gem5, git, …) is the operator's responsibility —
+    a misconfigured node simply fails the step, captured in the per-job log.
     """
     step_cls = get_step(step_name)
 
@@ -65,11 +67,5 @@ def _node_matches_step(node: Node, step_cls: type, target_os: str | None = None)
     # Check OS support declared by the step class
     if node.os_type not in step_cls.SUPPORTED_OS:
         return False
-
-    # Check required capabilities
-    node_caps = node.capabilities or {}
-    for cap in step_cls.REQUIRED_CAPABILITIES:
-        if not node_caps.get(cap):
-            return False
 
     return True

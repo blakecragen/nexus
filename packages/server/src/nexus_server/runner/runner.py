@@ -23,6 +23,29 @@ from nexus_server.runner.scheduler import find_node_for_step
 logger = logging.getLogger(__name__)
 
 
+def _format_log_block(idx: int, step_name: str, node_label: str, status: str, result: dict) -> str:
+    """Render one step's command + output as a terminal-log block."""
+    lines = [f"===== [step {idx}] {step_name} on {node_label} ====="]
+    command = result.get("command")
+    if command:
+        lines.append(f"$ {command}")
+    stdout = (result.get("stdout") or "").rstrip("\n")
+    stderr = (result.get("stderr") or "").rstrip("\n")
+    if stdout:
+        lines.append(stdout)
+    if stderr:
+        lines.append("--- stderr ---")
+        lines.append(stderr)
+    if status != "success":
+        err = result.get("error")
+        if err and not stderr:
+            lines.append(f"error: {err}")
+    ec = result.get("exit_code")
+    ec_part = f"exit code: {ec}  " if ec is not None else ""
+    lines.append(f"[{ec_part}status: {status}]")
+    return "\n".join(lines) + "\n\n"
+
+
 class JobRunner:
     """Manages the lifecycle of job execution.
 
@@ -59,18 +82,28 @@ class JobRunner:
         await ops.update_job(db, job_id, status="cancelled",
                              completed_at=datetime.now(timezone.utc))
 
-    def on_step_completed(self, job_id: str, step_index: int, outputs: dict) -> None:
+    def on_step_completed(self, job_id: str, step_index: int, outputs: dict,
+                          command: str | None = None, stdout: str | None = None,
+                          stderr: str | None = None, exit_code: int | None = None) -> None:
         """Called by WebSocket handler when agent reports step completion."""
         key = f"{job_id}:{step_index}"
-        self._step_results[key] = {"status": "success", "outputs": outputs}
+        self._step_results[key] = {
+            "status": "success", "outputs": outputs,
+            "command": command, "stdout": stdout, "stderr": stderr, "exit_code": exit_code,
+        }
         event = self._step_events.get(key)
         if event:
             event.set()
 
-    def on_step_failed(self, job_id: str, step_index: int, error: str) -> None:
+    def on_step_failed(self, job_id: str, step_index: int, error: str,
+                       command: str | None = None, stdout: str | None = None,
+                       stderr: str | None = None, exit_code: int | None = None) -> None:
         """Called by WebSocket handler when agent reports step failure."""
         key = f"{job_id}:{step_index}"
-        self._step_results[key] = {"status": "failed", "error": error}
+        self._step_results[key] = {
+            "status": "failed", "error": error,
+            "command": command, "stdout": stdout, "stderr": stderr, "exit_code": exit_code,
+        }
         event = self._step_events.get(key)
         if event:
             event.set()
@@ -129,6 +162,14 @@ class JobRunner:
                             target_pool_id=step_target_pool,
                             target_os=step_target_os,
                         )
+
+                    # Append this step's command + output to the per-job log
+                    # (committed incrementally so a crash leaves a partial log).
+                    node_label = result.get("node_label", "control-plane")
+                    await ops.append_job_log(
+                        db, job_id,
+                        _format_log_block(idx, step_name, node_label, result["status"], result),
+                    )
 
                     if result["status"] == "success":
                         outputs = result.get("outputs", {})
@@ -292,6 +333,7 @@ class JobRunner:
             await asyncio.wait_for(self._step_events[key].wait(), timeout=7200)
 
             result = self._step_results.pop(key, {"status": "failed", "error": "No result received"})
+            result["node_label"] = node.hostname or str(node.id)
             return result
 
         except asyncio.TimeoutError:

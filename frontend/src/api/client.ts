@@ -77,7 +77,60 @@ export const api = {
       method: "POST",
       body: JSON.stringify(data),
     }),
+  provisionNode: async (data: Record<string, unknown>) => {
+    // Custom fetch: provisioning can fail with a 502 whose body carries the
+    // install log, which we want to surface in the UI.
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    const token = getToken();
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+    const res = await fetch(`${API_BASE}/nodes/provision`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(data),
+    });
+    const body = await res.json().catch(() => null);
+    if (!res.ok) {
+      const detail = body?.detail;
+      const err = new Error(
+        typeof detail === "string" ? detail : detail?.error || `HTTP ${res.status}`
+      ) as Error & { log?: string[] };
+      err.log = (detail && typeof detail === "object" && detail.log) || [];
+      throw err;
+    }
+    return body as import("@/types").NodeInfo & {
+      api_key: string;
+      ws_url: string;
+      mode: string;
+      log: string[];
+    };
+  },
   deleteNode: (id: string) => request<void>(`/nodes/${id}`, { method: "DELETE" }),
+  reconnectNode: async (id: string, data: Record<string, unknown>) => {
+    // Like provisionNode: a 502 body carries the setup log we want to surface.
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    const token = getToken();
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+    const res = await fetch(`${API_BASE}/nodes/${id}/reconnect`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(data),
+    });
+    const body = await res.json().catch(() => null);
+    if (!res.ok) {
+      const detail = body?.detail;
+      const err = new Error(
+        typeof detail === "string" ? detail : detail?.error || `HTTP ${res.status}`
+      ) as Error & { log?: string[] };
+      err.log = (detail && typeof detail === "object" && detail.log) || [];
+      throw err;
+    }
+    return body as import("@/types").NodeInfo & {
+      ws_url: string;
+      mode: string;
+      online: boolean;
+      log: string[];
+    };
+  },
   setMaintenance: (id: string, enabled: boolean) =>
     request<import("@/types").NodeInfo>(`/nodes/${id}/maintenance`, {
       method: "PUT",
@@ -108,6 +161,15 @@ export const api = {
     return request<import("@/types").JobInfo[]>(`/jobs${qs}`);
   },
   getJob: (id: string) => request<import("@/types").JobDetail>(`/jobs/${id}`),
+  getJobLog: async (id: string): Promise<string> => {
+    // Plain-text endpoint — can't use request<T> (which does res.json()).
+    const headers: Record<string, string> = {};
+    const token = getToken();
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+    const res = await fetch(`${API_BASE}/jobs/${id}/log`, { headers });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.text();
+  },
   submitJob: (data: {
     name: string;
     steps: import("@/types").StepConfig[];

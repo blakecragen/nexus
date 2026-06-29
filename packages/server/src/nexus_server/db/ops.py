@@ -283,8 +283,8 @@ async def create_job(
     priority: int = 1, storage_target: str | None = None,
 ) -> Job:
     job = Job(
-        name=name, submitted_by=submitted_by, steps_config=steps_config,
-        target_pool_id=target_pool_id, target_node_id=target_node_id,
+        name=name, submitted_by=_sid(submitted_by), steps_config=steps_config,
+        target_pool_id=_sid(target_pool_id), target_node_id=_sid(target_node_id),
         priority=priority, storage_target=storage_target,
     )
     db.add(job)
@@ -318,7 +318,7 @@ async def list_jobs(
 
 
 async def update_job(db: AsyncSession, job_id: UUID, **kwargs: Any) -> Job | None:
-    job = await db.get(Job, job_id)
+    job = await db.get(Job, _sid(job_id))
     if not job:
         return None
     for k, v in kwargs.items():
@@ -328,14 +328,20 @@ async def update_job(db: AsyncSession, job_id: UUID, **kwargs: Any) -> Job | Non
     return job
 
 
+async def append_job_log(db: AsyncSession, job_id: UUID, text: str) -> None:
+    """Append a block of text to a job's aggregated terminal log. Committed
+    incrementally so a crash mid-job still leaves a partial log."""
+    job = await db.get(Job, _sid(job_id))
+    if job:
+        job.log_text = (job.log_text or "") + text
+        await db.commit()
+
+
 async def get_active_jobs(db: AsyncSession) -> list[Job]:
     result = await db.execute(
         select(Job).where(Job.status.in_(["pending", "queued", "running"]))
     )
-    return list(result.scalars().all())
-
-
-# ── Step Runs ───────────────────────────────────────────────────────────
+    return list(result.scalars().all())# ── Step Runs ───────────────────────────────────────────────────────────
 
 
 async def create_step_run(
