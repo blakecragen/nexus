@@ -95,7 +95,8 @@ class StepExecutor:
                     job_id=cmd.job_id,
                     step_index=cmd.step_index,
                     state=state,
-                ).model_dump(mode="json")
+                ).model_dump(mode="json"),
+                critical=True,
             )
 
             # If the step has a "command" in state, run it as a subprocess
@@ -117,7 +118,8 @@ class StepExecutor:
                     stdout=stdout,
                     stderr=stderr,
                     exit_code=exit_code,
-                ).model_dump(mode="json")
+                ).model_dump(mode="json"),
+                critical=True,
             )
             logger.info("Step %s/%d completed successfully", cmd.job_id, cmd.step_index)
 
@@ -133,7 +135,8 @@ class StepExecutor:
                     command=command,
                     stdout=stdout,
                     stderr=stderr,
-                ).model_dump(mode="json")
+                ).model_dump(mode="json"),
+                critical=True,
             )
         except Exception as exc:
             logger.error("Step %s/%d failed: %s", cmd.job_id, cmd.step_index, exc, exc_info=True)
@@ -147,7 +150,8 @@ class StepExecutor:
                     command=command,
                     stdout=stdout,
                     stderr=stderr,
-                ).model_dump(mode="json")
+                ).model_dump(mode="json"),
+                critical=True,
             )
         finally:
             self._running_steps.pop(key, None)

@@ -72,15 +72,46 @@ class AgentConnection:
                 self._running = False
                 break
 
-    async def send_message(self, message: dict[str, Any]) -> None:
-        """Send a JSON message to the server. Silently drops if not connected."""
-        if self._ws is None:
-            logger.warning("Cannot send message — not connected")
+    async def send_message(self, message: dict[str, Any], *, critical: bool = False) -> None:
+        """Send a JSON message to the server.
+
+        Heartbeats/logs are best-effort (dropped if disconnected). Step lifecycle
+        messages (started/completed/failed) are `critical`: if the socket is down
+        — e.g. a brief reconnect or a server `--reload` restart — we wait for the
+        connection to come back and retry, so a step result is never lost.
+        """
+        payload = json.dumps(message)
+        if not critical:
+            ws = self._ws
+            if ws is None:
+                logger.warning("Cannot send message — not connected")
+                return
+            try:
+                await ws.send(payload)
+            except websockets.exceptions.ConnectionClosed:
+                logger.warning("Send failed — connection closed")
             return
-        try:
-            await self._ws.send(json.dumps(message))
-        except websockets.exceptions.ConnectionClosed:
-            logger.warning("Send failed — connection closed")
+
+        # Critical: retry across reconnects (the run() loop re-establishes _ws).
+        attempts = 90  # ~90s of 1s retries — covers reconnect backoff + reload
+        for i in range(attempts):
+            ws = self._ws
+            if ws is not None:
+                try:
+                    await ws.send(payload)
+                    return
+                except websockets.exceptions.ConnectionClosed:
+                    pass
+            if i == 0:
+                logger.warning(
+                    "Not connected — will retry delivering %s until reconnected",
+                    message.get("type", "message"),
+                )
+            await asyncio.sleep(1.0)
+        logger.error(
+            "Gave up delivering %s after %ds — server unreachable",
+            message.get("type", "message"), attempts,
+        )
 
     def stop(self) -> None:
         """Signal the agent to stop after the current iteration."""
