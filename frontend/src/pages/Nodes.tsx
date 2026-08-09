@@ -1,3 +1,36 @@
+/**
+ * Nodes.tsx — the node inventory and lifecycle-management page (route `/nodes`).
+ *
+ * Role in the system:
+ *   The operator's view of every agent machine known to the cluster, plus the
+ *   admin workflows for getting machines *into* the cluster. It is the only
+ *   place in the UI that can:
+ *     - provision a brand-new node over SSH (server clones + installs the
+ *       agent on the target box),
+ *     - register a node "credentials only" and hand back a one-time API key,
+ *     - reconnect an offline node over SSH,
+ *     - toggle maintenance mode, and delete a node.
+ *
+ * Data flow:
+ *   - `useNodesStore` (`frontend/src/stores/index.ts`) -> GET /api/nodes.
+ *   - Mutations via `api` (`frontend/src/api/client.ts`):
+ *       POST   /api/nodes                  (register-only)
+ *       POST   /api/nodes/provision        (SSH install)
+ *       POST   /api/nodes/{id}/reconnect   (SSH restart)
+ *       PUT    /api/nodes/{id}/maintenance
+ *       DELETE /api/nodes/{id}
+ *   - `useAuthStore` gates every destructive/provisioning control behind
+ *     `role === "admin"`.
+ *
+ * Live updates: `<Layout />` owns the `/ws/dashboard` socket; `handleWsMessage`
+ * calls `useNodesStore.updateNodeStatus()` on `node.status` frames, so the
+ * status dot flips without a refetch. Note that only `status` is patched live —
+ * heartbeat/spec columns need a `fetchNodes()` to refresh.
+ *
+ * File layout: constants -> small presentational helpers -> dialogs
+ * (Delete / Reconnect / Register) -> slide-over detail panel -> the exported
+ * page component at the bottom.
+ */
 import { useEffect, useState, useCallback } from "react";
 import {
   Server,
@@ -27,6 +60,11 @@ import type { NodeInfo, OSType, NodeStatus } from "@/types";
 // Constants
 // ---------------------------------------------------------------------------
 
+/**
+ * Options for the OS filter dropdown. Values (other than the `"all"` sentinel)
+ * must match the server's `OSType` enum exactly — they are compared directly
+ * against `node.os_type` during client-side filtering.
+ */
 const OS_OPTIONS: { value: OSType | "all"; label: string }[] = [
   { value: "all", label: "All OS" },
   { value: "macos", label: "macOS" },
@@ -34,6 +72,14 @@ const OS_OPTIONS: { value: OSType | "all"; label: string }[] = [
   { value: "windows", label: "Windows" },
 ];
 
+/**
+ * Options for the status filter dropdown.
+ *
+ * AI Note: node filtering on this page is entirely client-side (unlike
+ * `Jobs.tsx`, which pushes `?status=` to the server). GET /api/nodes returns
+ * the full inventory and {@link NodesPage} narrows it in memory, so the count
+ * badge reflects the filtered subset, not the cluster total.
+ */
 const STATUS_OPTIONS: { value: NodeStatus | "all"; label: string }[] = [
   { value: "all", label: "All Status" },
   { value: "online", label: "Online" },
@@ -42,6 +88,8 @@ const STATUS_OPTIONS: { value: NodeStatus | "all"; label: string }[] = [
   { value: "maintenance", label: "Maintenance" },
 ];
 
+/** Dot colour per node status, used by {@link StatusBadge}. Keys must cover the
+ * whole `NodeStatus` union or the dot renders unstyled. */
 const STATUS_COLORS: Record<NodeStatus, string> = {
   online: "bg-green-500",
   offline: "bg-gray-400",
@@ -49,6 +97,9 @@ const STATUS_COLORS: Record<NodeStatus, string> = {
   maintenance: "bg-orange-500",
 };
 
+/** Label colour per node status (dark-mode aware). Parallel to
+ * {@link STATUS_COLORS}; both are indexed by the same key in
+ * {@link StatusBadge}, so they must be kept in lockstep. */
 const STATUS_TEXT_COLORS: Record<NodeStatus, string> = {
   online: "text-green-600 dark:text-green-400",
   offline: "text-gray-500 dark:text-gray-400",
@@ -60,6 +111,17 @@ const STATUS_TEXT_COLORS: Record<NodeStatus, string> = {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Icon + label for a node's operating system, used in the OS table column.
+ *
+ * @param os the node's `os_type` as reported by the agent at registration.
+ *
+ * AI Note: the switch has no `default` branch — it relies on `OSType` being an
+ * exhaustive union so TypeScript flags a missing case when a new OS is added.
+ * At runtime an unexpected value renders nothing (empty cell) rather than
+ * throwing. macOS and Windows deliberately share the `Monitor` glyph; only the
+ * label distinguishes them.
+ */
 function OsIcon({ os }: { os: OSType }) {
   switch (os) {
     case "macos":
@@ -86,6 +148,13 @@ function OsIcon({ os }: { os: OSType }) {
   }
 }
 
+/**
+ * Coloured dot + capitalised status word. Used in both the table row and the
+ * slide-over detail panel so they can never drift visually.
+ *
+ * Purely presentational: reads {@link STATUS_COLORS} / {@link STATUS_TEXT_COLORS}
+ * and nothing else.
+ */
 function StatusBadge({ status }: { status: NodeStatus }) {
   return (
     <span className="inline-flex items-center gap-1.5">
@@ -97,6 +166,16 @@ function StatusBadge({ status }: { status: NodeStatus }) {
   );
 }
 
+/**
+ * Renders `node.ram_mb` (always megabytes on the wire) as a human string.
+ *
+ * @param mb total RAM in MB as reported by the agent.
+ * @returns e.g. `"512 MB"` or `"16 GB"`.
+ *
+ * AI Note: uses the binary 1024 divisor and `toFixed(0)`, so 16384 MB shows as
+ * "16 GB" but 12500 MB rounds to "12 GB". This is a deliberately lossy display
+ * format — never parse it back into a number.
+ */
 function formatRam(mb: number): string {
   if (mb >= 1024) return `${(mb / 1024).toFixed(0)} GB`;
   return `${mb} MB`;
@@ -106,6 +185,26 @@ function formatRam(mb: number): string {
 // Filter Dropdown (lightweight, no Radix dependency required)
 // ---------------------------------------------------------------------------
 
+/**
+ * Generic single-select dropdown used for the OS and Status filters.
+ *
+ * Deliberately hand-rolled (no Radix/headless-ui) to keep the bundle small; it
+ * is a controlled component, so the parent owns the selected value.
+ *
+ * @typeParam T the union of allowed values (e.g. `OSType | "all"`).
+ * @param options list rendered in the menu; `value` is returned to `onChange`.
+ * @param value currently selected value; the matching option's label is shown
+ *   on the trigger button, falling back to "Select" if no option matches.
+ * @param onChange called with the chosen value, then the menu auto-closes.
+ *
+ * AI Note: the invisible `fixed inset-0 z-10` div is the click-outside catcher.
+ * It must stay *below* the menu (`z-20`) and *above* the rest of the page, or
+ * either the menu becomes unclickable or outside clicks stop dismissing it.
+ * This is why there is no document-level mousedown listener here.
+ *
+ * AI Note: no keyboard/ARIA support (no Escape-to-close, no roving focus, no
+ * `role="listbox"`). Known gap — do not assume this is accessible.
+ */
 function FilterDropdown<T extends string>({
   options,
   value,
@@ -159,6 +258,17 @@ function FilterDropdown<T extends string>({
 // Delete Confirmation Dialog
 // ---------------------------------------------------------------------------
 
+/**
+ * Modal confirmation for node deletion.
+ *
+ * Stateless — the parent ({@link NodeDetailPanel}) decides when to mount it and
+ * supplies both callbacks. `onConfirm` is what actually issues
+ * DELETE /api/nodes/{id}; this component performs no I/O and shows no spinner,
+ * so the parent is responsible for closing it.
+ *
+ * @param hostname shown in the prompt so the operator can double-check the
+ *   target before destroying it.
+ */
 function DeleteDialog({
   hostname,
   onConfirm,
@@ -201,6 +311,31 @@ function DeleteDialog({
 // Reconnect (Bring Online) Dialog
 // ---------------------------------------------------------------------------
 
+/**
+ * "Bring Node Online" dialog — SSHes into an offline node and restarts its
+ * agent via POST /api/nodes/{id}/reconnect.
+ *
+ * What the user sees: a credentials form (host, user, password OR "use the
+ * server's SSH key"), then, after submit, a success/warning panel plus the raw
+ * setup log streamed back by the server.
+ *
+ * State machine: form -> (submitting) -> either `error` + `errorLog` shown
+ * inline with the form still editable, or `done` set, which swaps the whole
+ * body for the result panel. There is no way back to the form once `done` is
+ * set; the operator closes and reopens.
+ *
+ * @param node the offline node being reconnected; supplies the id for the
+ *   request and the last-known IP as a default host.
+ * @param onClose dismiss the dialog.
+ * @param onDone called immediately after a successful request so the parent can
+ *   refetch the node list; note it fires *before* the user dismisses the result
+ *   panel, so the table updates behind the modal.
+ *
+ * AI Note: SSH credentials are intentionally never persisted anywhere — they
+ * live in component state only, are POSTed to the server to open a one-shot
+ * session, and vanish when the dialog unmounts. Do not add localStorage
+ * caching here.
+ */
 function ReconnectDialog({
   node,
   onClose,
@@ -210,7 +345,9 @@ function ReconnectDialog({
   onClose: () => void;
   onDone: () => void;
 }) {
-  // Default SSH host to the node's last-known IP if it's real.
+  // AI Note: "0.0.0.0" is the placeholder IP written by register-only node
+  // creation (see RegisterNodeDialog), not a real address — treating it as a
+  // default SSH host would guarantee a failed connection, so it is filtered out.
   const defaultHost = node.ip_address && node.ip_address !== "0.0.0.0" ? node.ip_address : "";
   const [sshHost, setSshHost] = useState(defaultHost);
   const [sshUser, setSshUser] = useState("");
@@ -221,8 +358,28 @@ function ReconnectDialog({
   const [errorLog, setErrorLog] = useState<string[]>([]);
   const [done, setDone] = useState<{ online: boolean; log: string[] } | null>(null);
 
+  // Submit gate: host and user are always required; a password is required
+  // unless the operator opted into the server's own SSH key/agent.
   const incomplete = !sshHost.trim() || !sshUser.trim() || (!useServerKey && !sshPassword);
 
+  /**
+   * POSTs /api/nodes/{id}/reconnect and renders the outcome.
+   *
+   * AI Note: `ssh_password` is sent as `undefined` (i.e. omitted from the JSON
+   * body) rather than an empty string when `useServerKey` is on — the server
+   * distinguishes "no password field" (use key auth) from "empty password".
+   *
+   * AI Note: `api.reconnectNode` is one of the hand-rolled fetches in
+   * `client.ts` that attaches a `log` array to the thrown Error, because a
+   * failed SSH provision returns 502 with the install log in `detail.log`.
+   * That is why the catch reads `(err as Error & { log?: string[] }).log` —
+   * a plain `request<T>()` call would have discarded it.
+   *
+   * AI Note: `res.online === false` is NOT an error. It means the agent was
+   * installed and started but its WebSocket has not dialled back yet (typical
+   * with VPN/firewall/asymmetric routing). The agent keeps retrying, so the
+   * result panel shows a yellow "still connecting" state instead of red.
+   */
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setSubmitting(true);
@@ -246,6 +403,9 @@ function ReconnectDialog({
   };
 
   return (
+    // AI Note: z-[60] (not z-50) because this dialog is opened *from* the
+    // NodeDetailPanel slide-over, which already occupies z-50. Lowering this
+    // would render the dialog behind the panel that launched it.
     <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 p-4">
       <div className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-xl border border-border bg-background p-6 shadow-xl">
         <div className="flex items-center justify-between">
@@ -263,6 +423,10 @@ function ReconnectDialog({
               aren't stored, so re-enter them.
             </p>
 
+            {/* AI Note: focus is placed on whichever field is still blank —
+                host when there was no usable last-known IP, otherwise user.
+                The two `autoFocus` expressions are deliberate inverses; keep
+                them mutually exclusive or React focuses the later one. */}
             <div className="grid grid-cols-2 gap-3">
               <div>
                 <label htmlFor="rc-host" className="mb-1.5 block text-sm font-medium">SSH host / IP</label>
@@ -366,6 +530,29 @@ function ReconnectDialog({
 // Node Detail Panel (slide-over)
 // ---------------------------------------------------------------------------
 
+/**
+ * Right-hand slide-over showing everything known about one node, plus its
+ * lifecycle actions.
+ *
+ * What the user sees: header with display name, a status badge, a spec
+ * definition list (OS, arch, CPU, RAM, GPU, IP, agent version, registration
+ * date, last heartbeat), tag chips, and an Actions block.
+ *
+ * Action visibility:
+ *   - "Bring Online" — admins only, and only when the node is `offline`.
+ *   - "Enable/Disable Maintenance" — visible to every authenticated user.
+ *   - "Delete Node" — admins only.
+ *
+ * AI Note: these are UI affordances, not authorisation. The server re-checks
+ * the caller's role on every one of these endpoints; hiding a button here must
+ * never be treated as the security boundary.
+ *
+ * @param node the currently selected node. The parent keeps this object in sync
+ *   with the store after refetches, so the panel re-renders with fresh data.
+ * @param onClose closes the slide-over.
+ * @param onRefresh refetches the node list; called after maintenance toggles,
+ *   deletes, and successful reconnects.
+ */
 function NodeDetailPanel({
   node,
   onClose,
@@ -381,6 +568,18 @@ function NodeDetailPanel({
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
   const [reconnectOpen, setReconnectOpen] = useState(false);
 
+  /**
+   * Flips the node in/out of maintenance via PUT /api/nodes/{id}/maintenance.
+   *
+   * AI Note: the desired state is derived as `node.status !== "maintenance"`,
+   * i.e. any non-maintenance status (including `offline`) means "turn it on".
+   * There is no separate persisted maintenance flag read here — status is the
+   * single source of truth, so a node that goes offline while in maintenance
+   * will show "Enable Maintenance" again.
+   *
+   * Failures are only logged to the console; the panel shows no error UI, and
+   * `onRefresh()` is skipped so the stale status stays on screen.
+   */
   const toggleMaintenance = async () => {
     setMaintenanceLoading(true);
     try {
@@ -394,6 +593,16 @@ function NodeDetailPanel({
     }
   };
 
+  /**
+   * Permanently removes the node: DELETE /api/nodes/{id}, refetch, then close
+   * the slide-over (order matters — closing first would unmount before the
+   * refresh is issued).
+   *
+   * AI Note: `deleteTarget` is never cleared on the success path; the panel
+   * unmounts via `onClose()` instead, which tears down that state. On failure
+   * the confirmation dialog stays open with no error shown (console only), so
+   * a repeated click just retries.
+   */
   const handleDelete = async () => {
     try {
       await api.deleteNode(node.id);
@@ -568,6 +777,22 @@ function NodeDetailPanel({
 // Copyable code row
 // ---------------------------------------------------------------------------
 
+/**
+ * A read-only `<code>` block with a copy-to-clipboard button.
+ *
+ * Used for the one-time node API key and the generated `nexus-agent run`
+ * command in {@link RegisterNodeDialog}.
+ *
+ * State: `copied` drives a checkmark that reverts to the copy icon after
+ * 1500 ms.
+ *
+ * AI Note: `navigator.clipboard` requires a secure context — over plain HTTP
+ * on a non-localhost origin the write rejects, the catch swallows it, and the
+ * icon simply never flips to a checkmark. The value stays selectable in the
+ * `<code>` element so manual copy still works. Also note the timeout is not
+ * cleared on unmount; harmless here (the setState no-ops on an unmounted
+ * component in React 18) but do not copy this pattern into long-lived UI.
+ */
 function CopyRow({ value }: { value: string }) {
   const [copied, setCopied] = useState(false);
   const copy = async () => {
@@ -600,6 +825,25 @@ function CopyRow({ value }: { value: string }) {
 // Register Node Dialog (admin only)
 // ---------------------------------------------------------------------------
 
+/**
+ * "Add Node" dialog (admin only) — the entry point for both onboarding paths.
+ *
+ * Two modes, toggled by the `setupSsh` checkbox at the top:
+ *
+ *   1. **Provision over SSH** (default). POST /api/nodes/provision. The server
+ *      SSHes into the target box, clones the agent from GitHub, installs it
+ *      (optionally installing Python 3.12 via Homebrew and/or registering a
+ *      boot service) and starts it. On success the dialog shows the setup log
+ *      and whether the agent has connected back yet.
+ *   2. **Register only**. POST /api/nodes. Creates the DB row and returns a
+ *      one-time `api_key`, which is displayed together with a ready-to-paste
+ *      `nexus-agent run ...` command for the operator to run manually.
+ *
+ * @param onCreated called right after either request succeeds so the parent can
+ *   refetch the node table (fires before the operator dismisses the dialog).
+ * @param onClose dismisses the dialog. In register-only mode this is the point
+ *   of no return for the API key — see the note on `result.api_key` below.
+ */
 function RegisterNodeDialog({
   onCreated,
   onClose,
@@ -612,7 +856,7 @@ function RegisterNodeDialog({
   const [tags, setTags] = useState("");
   const [osType, setOsType] = useState<OSType>("linux"); // register-only mode
 
-  // SSH provisioning fields
+  // SSH provisioning fields (mode 1). Never persisted — see ReconnectDialog.
   const [sshHost, setSshHost] = useState("");
   const [sshUser, setSshUser] = useState("");
   const [sshPassword, setSshPassword] = useState("");
@@ -623,13 +867,28 @@ function RegisterNodeDialog({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [errorLog, setErrorLog] = useState<string[]>([]);
+  // AI Note: `result` is the union of both endpoints' response shapes; the
+  // SSH-only fields (ws_url/mode/online/log) are optional because the
+  // register-only path never returns them. `provisioned` — not the presence of
+  // those fields — is what selects which success panel renders.
   const [result, setResult] = useState<
     (NodeInfo & { api_key: string; ws_url?: string; mode?: string; online?: boolean; log?: string[] }) | null
   >(null);
   const [provisioned, setProvisioned] = useState(false);
 
+  /** Splits the comma-separated tag input into a clean string array, dropping
+   * blanks so `"a, ,b,"` becomes `["a", "b"]`. */
   const tagList = () => tags.split(",").map((t) => t.trim()).filter(Boolean);
 
+  /**
+   * Runs whichever onboarding path the `setupSsh` toggle selected and stores
+   * the response in `result`, which switches the dialog into its success view.
+   *
+   * AI Note: like {@link ReconnectDialog}, the catch pulls `.log` off the Error
+   * because `api.provisionNode` attaches the partial install log from a 502
+   * body. A generic `request<T>()` error would have `log === undefined`, hence
+   * the `|| []` fallback.
+   */
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setSubmitting(true);
@@ -653,6 +912,12 @@ function RegisterNodeDialog({
       } else {
         // Register only — hardware fields are placeholders; the agent reports
         // its real specs on connect. Only display_name (+ tags) persist.
+        //
+        // AI Note: these literals are not arbitrary. `hostname: "pending"`,
+        // `cpu_model: "pending"` and `ip_address: "0.0.0.0"` are the sentinels
+        // the rest of the UI keys off — e.g. ReconnectDialog refuses to
+        // pre-fill an SSH host of "0.0.0.0". The POST body must satisfy the
+        // server's required-field validation, which is why they exist at all.
         const created = await api.createNode({
           hostname: name.trim() || "pending",
           display_name: name.trim() || undefined,
@@ -679,11 +944,17 @@ function RegisterNodeDialog({
     }
   };
 
+  // AI Note: the suggested agent command is assembled from the *browser's*
+  // hostname and a hard-coded port 8000 — the server never tells us its own
+  // externally reachable address. If the dashboard is behind a reverse proxy,
+  // on a different port, or the agent sits on another network segment, this
+  // command is wrong and the operator must edit it (the UI says so below).
   const wsHost = window.location.hostname || "localhost";
   const runCmd = result
     ? `nexus-agent run --server ws://${wsHost}:8000/ws/agent/${result.id} --api-key ${result.api_key} --node-id ${result.id}`
     : "";
 
+  // Same submit gate as ReconnectDialog; only enforced when in SSH mode.
   const sshIncomplete = !sshHost.trim() || !sshUser.trim() || (!useServerKey && !sshPassword);
   const title = result
     ? (provisioned ? "Node Set Up" : "Node Registered")
@@ -903,6 +1174,11 @@ function RegisterNodeDialog({
               an agent connects with the credentials below.
             </p>
 
+            {/* AI Note: security-sensitive — `result.api_key` is the plaintext
+                node key and the server only ever returns it in this one
+                create response (it stores a hash). Closing this dialog loses
+                it permanently; the only recovery is deleting and re-creating
+                the node. Do not add logging/telemetry around this value. */}
             <div>
               <div className="mb-1.5 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
                 <KeyRound className="h-3.5 w-3.5" /> API Key
@@ -944,6 +1220,21 @@ function RegisterNodeDialog({
 // Main Page
 // ---------------------------------------------------------------------------
 
+/**
+ * Node inventory page (route `/nodes`).
+ *
+ * What the user sees: a header with the filtered node count, two filter
+ * dropdowns (OS, status), an admin-only "Add Node" button, and a table of
+ * nodes (hostname, OS, status, arch, CPU, RAM, IP, last heartbeat). Clicking a
+ * row opens the {@link NodeDetailPanel} slide-over. Empty state offers a
+ * "Register your first node" shortcut when the cluster is genuinely empty
+ * (not merely filtered to nothing).
+ *
+ * Side effects: GET /api/nodes on mount and on every explicit refresh. All
+ * mutations live in the child dialogs/panel.
+ *
+ * Props: none — routed component.
+ */
 export default function NodesPage() {
   const { nodes, isLoading, fetch: fetchNodes } = useNodesStore();
   const user = useAuthStore((s) => s.user);
@@ -957,11 +1248,25 @@ export default function NodesPage() {
     fetchNodes();
   }, [fetchNodes]);
 
+  /** Reload the node list. Passed to every child that mutates a node so the
+   * table (and, via the effect below, the open slide-over) picks up the change.
+   * Wrapped in `useCallback` to keep child prop identity stable. */
   const refreshAndReselect = useCallback(async () => {
     await fetchNodes();
   }, [fetchNodes]);
 
   // Keep selected node in sync after refresh
+  //
+  // AI Note: `selectedNode` holds a *snapshot* object, not an id, so after a
+  // refetch it would otherwise show stale specs/status. This effect re-resolves
+  // it against the fresh store array and closes the panel when the node is gone
+  // (e.g. just deleted).
+  //
+  // AI Note: `selectedNode` is in the dependency array while the effect also
+  // calls `setSelectedNode` — this only terminates because `nodes.find` returns
+  // the same object reference on the next pass, so React bails out of the
+  // re-render. If this store ever starts returning freshly-constructed node
+  // objects on every read, this becomes an infinite render loop.
   useEffect(() => {
     if (selectedNode) {
       const updated = nodes.find((n) => n.id === selectedNode.id);
@@ -970,6 +1275,8 @@ export default function NodesPage() {
     }
   }, [nodes, selectedNode]);
 
+  // Client-side filtering (see the note on STATUS_OPTIONS): the server returns
+  // every node and both dropdowns narrow the list in memory.
   const filtered = nodes.filter((node) => {
     if (osFilter !== "all" && node.os_type !== osFilter) return false;
     if (statusFilter !== "all" && node.status !== statusFilter) return false;
@@ -1014,6 +1321,10 @@ export default function NodesPage() {
         <div className="rounded-xl border border-dashed border-border py-16 text-center">
           <Server className="mx-auto h-10 w-10 text-muted-foreground/50" />
           <p className="mt-3 text-sm text-muted-foreground">No nodes found</p>
+          {/* AI Note: the `nodes.length === 0` guard distinguishes "the cluster
+              is empty" from "your filters matched nothing" — offering
+              "Register your first node" in the latter case would be
+              misleading. */}
           {isAdmin && nodes.length === 0 && (
             <button
               type="button"

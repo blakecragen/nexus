@@ -13,12 +13,26 @@
 #   ./dev.sh logs     # tail API + frontend logs
 #   ./dev.sh status   # check what's running
 #   ./dev.sh reset    # delete nexus.db and restart fresh
+#
+# Layout it manages:
+#   Docker  — redis (:6379) + minio (:9000/:9001) from docker-compose.yml
+#   API     — uvicorn nexus_server.main:app on :8000, from the .venv
+#   UI      — vite dev server on :3000, proxying /api and /ws to :8000
+#   DB      — SQLite file nexus.db in the repo root (no Postgres in dev)
+#
+# Background mode writes PID files (.nexus-api.pid/.nexus-ui.pid) and logs
+# (.nexus-api.log/.nexus-ui.log) into the repo root; `stop` and `status` read
+# them. Companion scripts: diagnose.sh (read-only health check) and
+# add_node.sh (attach agent nodes to the running stack).
 # ─────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
+# Everything is resolved relative to the repo root, so the script works from
+# any cwd (docker compose, .env, nexus.db and the pid/log files all live here).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# ANSI colour codes used by the log helpers below (NC = reset).
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -26,12 +40,28 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
+# Log helpers: info = progress, ok = success, warn = non-fatal, err = fatal
+# (stderr). Callers are responsible for exiting after err.
 info()  { echo -e "${BLUE}[nexus]${NC} $*"; }
 ok()    { echo -e "${GREEN}[nexus]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[nexus]${NC} $*"; }
 err()   { echo -e "${RED}[nexus]${NC} $*" >&2; }
 
 # ── Load .env ───────────────────────────────────────────────────────────
+# Source .env and export the derived settings the API server reads. Exits 1 if
+# .env is missing, since JWT_SECRET and the credential encryption key have no
+# safe defaults.
+#
+# AI Note: `set -a` makes every subsequent assignment (including those inside
+# .env) automatically exported, which is how the sourced values reach uvicorn.
+# It is turned back off immediately with `set +a` — leaving it on would export
+# every local variable in the rest of the script.
+#
+# AI Note: the ${VAR:-default} defaults apply only when the value is unset OR
+# empty, so a blank line in .env falls back rather than passing an empty string
+# to the server. Note MINIO_ACCESS_KEY/SECRET_KEY are renamed from the
+# MINIO_ROOT_USER/PASSWORD names docker-compose.yml uses — the compose file and
+# the app expect different variable names for the same credentials.
 load_env() {
     if [[ ! -f .env ]]; then
         err ".env file not found. Copy .env.template to .env and fill in values."
@@ -50,6 +80,9 @@ load_env() {
 }
 
 # ── Preflight ───────────────────────────────────────────────────────────
+# Verify the four required tools exist and that the Docker daemon is actually
+# running (not just installed). Exits 1 with the full list of what's missing so
+# the user fixes everything in one pass rather than one error at a time.
 check_deps() {
     local missing=()
     command -v docker  &>/dev/null || missing+=("docker")
@@ -71,15 +104,28 @@ check_deps() {
 }
 
 # ── Infrastructure (Redis + MinIO only) ─────────────────────────────────
+# Bring up the two stateful services and block until each is genuinely ready
+# (not merely "container created"), then print the connection summary.
+#
+# AI Note: only `redis minio` are named — docker-compose.yml also defines API
+# and frontend services, which dev mode deliberately does NOT use (they run
+# from source with hot reload instead). Adding services here would start
+# duplicates fighting for :8000/:3000.
 start_infra() {
     info "Starting infrastructure (Redis, MinIO)..."
+    # `down --remove-orphans` first so containers from an older compose file
+    # revision can't linger and hold the ports.
     docker compose down --remove-orphans 2>/dev/null || true
     docker compose up redis minio -d
 
+    # AI Note: readiness is polled with a real protocol check (redis-cli PING /
+    # MinIO's health endpoint), not `sleep`. Container "up" precedes accepting
+    # connections, and the API crashes on startup if Redis isn't listening yet.
     info "Waiting for Redis..."
     local retries=15
     until docker compose exec -T redis redis-cli ping 2>/dev/null | grep -q PONG; do
         retries=$((retries - 1))
+        # Redis is required — a timeout here is fatal.
         if [[ $retries -le 0 ]]; then err "Redis failed to start."; exit 1; fi
         sleep 1
     done
@@ -89,6 +135,9 @@ start_infra() {
     retries=15
     until curl -sf http://localhost:9000/minio/health/live &>/dev/null; do
         retries=$((retries - 1))
+        # AI Note: unlike Redis, a MinIO timeout only warns and continues. The
+        # stack is usable without object storage (jobs that don't upload
+        # artifacts still run), so this is intentionally non-fatal.
         if [[ $retries -le 0 ]]; then warn "MinIO health check timed out."; break; fi
         sleep 1
     done
@@ -104,6 +153,14 @@ start_infra() {
 }
 
 # ── Python packages ─────────────────────────────────────────────────────
+# Create .venv if absent, then editable-install the three server-side packages
+# (common, steps, server). Editable mode is what makes uvicorn --reload pick up
+# source edits without reinstalling.
+#
+# AI Note: the agent package is deliberately NOT installed — the controller
+# doesn't run an agent. Nodes install it themselves via nexus_deploy.py.
+# AI Note: `| tail -5` hides pip's progress noise, but it also means a genuine
+# install failure only shows its last five lines here.
 install_python() {
     info "Installing Python packages (editable mode)..."
     if [[ ! -d .venv ]]; then
@@ -112,10 +169,28 @@ install_python() {
     fi
     source .venv/bin/activate
     pip install --quiet -e packages/common -e packages/steps -e packages/server 2>&1 | tail -5
+
+    # AI Note: on this machine (project lives under iCloud Drive), the
+    # editable-install shim files pip just (re)generated
+    # (_editable_impl_*.pth) come back with the macOS UF_HIDDEN flag set.
+    # Python 3.14's site.py silently SKIPS hidden .pth files, so nexus_common/
+    # nexus_steps/nexus_server never land on sys.path and every import fails
+    # with a bare "ModuleNotFoundError: No module named 'nexus_server'" that
+    # gives no hint why. `chflags` is macOS-only, hence the command -v guard.
+    if command -v chflags &>/dev/null; then
+        chflags nohidden .venv/lib/python*/site-packages/_editable_impl_nexus_*.pth 2>/dev/null || true
+    fi
     ok "Python packages installed."
 }
 
 # ── API Server ──────────────────────────────────────────────────────────
+# Run uvicorn in the FOREGROUND (the `./dev.sh api` subcommand). Used when you
+# want the server's output inline and Ctrl-C to stop it; start_all runs the
+# same command detached instead.
+#
+# AI Note: binds 0.0.0.0, not 127.0.0.1 — required so remote agent nodes on the
+# LAN can reach /ws/agent. It also means the dev API is exposed to the whole
+# local network with dev credentials, which is fine on a trusted lab LAN only.
 start_api() {
     load_env
     [[ -f .venv/bin/activate ]] && source .venv/bin/activate
@@ -126,6 +201,9 @@ start_api() {
 }
 
 # ── Frontend ────────────────────────────────────────────────────────────
+# npm install in frontend/. Runs unconditionally (npm is a no-op when
+# node_modules is already current) so a freshly pulled dependency change can't
+# leave the dev server broken.
 install_frontend() {
     info "Installing frontend dependencies..."
     cd frontend
@@ -136,6 +214,9 @@ install_frontend() {
     ok "Frontend dependencies installed."
 }
 
+# Run the vite dev server in the FOREGROUND (the `./dev.sh ui` subcommand).
+# Vite's config proxies /api and /ws through to the API on :8000, so the
+# frontend is useless on its own — start the API first.
 start_frontend() {
     info "Starting frontend on http://localhost:3000 ..."
     echo -e "  ${YELLOW}Press Ctrl+C to stop.${NC}"
@@ -144,6 +225,14 @@ start_frontend() {
 }
 
 # ── Kill anything on a port ─────────────────────────────────────────────
+# Force-kill every process listening on $1 and pause for the socket to be
+# released. Used to clear stale servers before (re)starting.
+#
+# AI Note: this is a blunt `kill -9` on whatever holds the port — including a
+# process that is not Nexus. Acceptable for the fixed dev ports 8000/3000, but
+# never generalise it to a user-supplied port.
+# AI Note: the `sleep 1` matters: bind() can still fail with EADDRINUSE for a
+# moment after the owner dies, so removing it makes startup flaky.
 kill_port() {
     local port=$1
     local pids
@@ -155,6 +244,12 @@ kill_port() {
 }
 
 # ── Full startup ────────────────────────────────────────────────────────
+# The default command: preflight -> infra -> install deps -> clear ports ->
+# launch API and UI detached -> print the access summary.
+#
+# Ordering is load-bearing: infra must be ready before the API starts (it
+# connects to Redis at import time), and the ports must be cleared before
+# launching or the new servers silently fail to bind.
 start_all() {
     echo ""
     echo -e "${CYAN}╔══════════════════════════════════════════╗${NC}"
@@ -174,6 +269,16 @@ start_all() {
     kill_port 3000
 
     # Start API in background
+    #
+    # AI Note: the config is re-exported INSIDE the nohup'd subshell rather than
+    # inherited. `nohup bash -c` starts a fresh shell, and `--reload` makes
+    # uvicorn re-exec workers — the explicit exports are what guarantee the
+    # reloaded worker still sees JWT_SECRET/DATABASE_URL etc. Dropping them
+    # produces a server that works until the first hot reload, then breaks.
+    #
+    # AI Note: the values are interpolated into a double-quoted string, so a
+    # secret containing a single quote would break the command. Keep .env values
+    # free of quote characters.
     info "Starting API server (background, logs at .nexus-api.log)..."
     nohup bash -c "cd '$SCRIPT_DIR' && source .venv/bin/activate && \
         export DATABASE_URL='$DATABASE_URL' \
@@ -187,16 +292,22 @@ start_all() {
         NEXUS_ADMIN_PASSWORD='${NEXUS_ADMIN_PASSWORD:-admin}' && \
         uvicorn nexus_server.main:app --reload --host 0.0.0.0 --port 8000" \
         > .nexus-api.log 2>&1 &
+    # AI Note: $! is the PID of the wrapper `bash -c`, not of uvicorn itself.
+    # stop_all therefore also calls kill_port 8000 to catch the real server
+    # process (and any --reload children) that killing the wrapper leaves behind.
     echo $! > .nexus-api.pid
     ok "API server started (PID $(cat .nexus-api.pid))"
 
     # Start frontend in background
+    # Same wrapper-PID caveat as the API above; stop_all backs this up with
+    # kill_port 3000 and a pkill for the vite process.
     info "Starting frontend (background, logs at .nexus-ui.log)..."
     nohup bash -c "cd '$SCRIPT_DIR/frontend' && npm run dev" \
         > .nexus-ui.log 2>&1 &
     echo $! > .nexus-ui.pid
     ok "Frontend started (PID $(cat .nexus-ui.pid))"
 
+    # Give both servers a moment to bind before printing "it's running".
     sleep 3
 
     echo ""
@@ -221,6 +332,13 @@ start_all() {
 }
 
 # ── Stop ────────────────────────────────────────────────────────────────
+# Tear everything down: API, frontend, docker services, pid files and logs.
+# Deliberately belt-and-braces — kill the recorded PID, then sweep the port,
+# because the recorded PID is only the nohup wrapper (see start_all).
+#
+# AI Note: nexus.db is intentionally NOT removed here; `reset` is the command
+# that wipes data. AI Note: `docker compose down` (no -v) also preserves the
+# Redis/MinIO volumes across restarts.
 stop_all() {
     info "Stopping Nexus..."
 
@@ -229,11 +347,13 @@ stop_all() {
         kill "$pid" 2>/dev/null && ok "API server stopped (PID $pid)" || true
         rm -f .nexus-api.pid
     fi
+    # Catch uvicorn/--reload children the wrapper PID didn't cover.
     kill_port 8000
 
     if [[ -f .nexus-ui.pid ]]; then
         local pid; pid=$(cat .nexus-ui.pid)
         kill "$pid" 2>/dev/null && ok "Frontend stopped (PID $pid)" || true
+        # npm spawns vite as a child; killing npm can orphan it.
         pkill -f "vite.*nexus" 2>/dev/null || true
         rm -f .nexus-ui.pid
     fi
@@ -246,6 +366,9 @@ stop_all() {
 }
 
 # ── Reset (fresh DB) ───────────────────────────────────────────────────
+# DESTRUCTIVE: stop everything, delete nexus.db, then start fresh. All nodes,
+# jobs, pools, users and stored credentials are lost, and the admin user is
+# re-seeded from NEXUS_ADMIN_PASSWORD on the next boot. There is no prompt.
 reset_all() {
     stop_all
     if [[ -f nexus.db ]]; then
@@ -257,21 +380,38 @@ reset_all() {
 }
 
 # ── Tail logs ───────────────────────────────────────────────────────────
+# Follow both background log files at once. Errors out if neither exists,
+# which normally means the stack was never started (or is running in the
+# foreground via `./dev.sh api` / `./dev.sh ui`).
 tail_logs() {
     [[ -f .nexus-api.log ]] || [[ -f .nexus-ui.log ]] || { err "No log files. Is Nexus running?"; exit 1; }
     tail -f .nexus-api.log .nexus-ui.log
 }
 
 # ── Status ──────────────────────────────────────────────────────────────
+# Print a one-screen summary: docker services, DB file presence/size, and
+# whether the recorded API/UI PIDs are still alive.
+#
+# AI Note: liveness is `kill -0 <pid>` (signal-less existence check), so a
+# process that exists but is hung still reports "running". Use diagnose.sh for
+# an actual request-level health check.
 show_status() {
     echo ""
     echo -e "${CYAN}Nexus Status${NC}"
     echo "─────────────────────────────────"
-    for svc in redis minio; do
+    # AI Note: labels are carried explicitly in "service:Label" pairs rather than
+    # derived with ${svc^}. That parameter expansion is bash 4+, and macOS ships
+    # bash 3.2 (/usr/bin/env bash -> 3.2.57), where it aborts the whole function
+    # with "bad substitution". Hardcoding is also more correct: ${svc^} would
+    # render "Minio" rather than the product's actual "MinIO" capitalisation.
+    # bash 3.2 has no associative arrays either, hence the ${entry%%:*} split.
+    for entry in "redis:Redis" "minio:MinIO"; do
+        svc="${entry%%:*}"
+        label="${entry##*:}"
         if docker compose ps --status running 2>/dev/null | grep -q "$svc"; then
-            echo -e "  ${svc^}:$(printf '%*s' $((10 - ${#svc})) '') ${GREEN}running${NC}"
+            echo -e "  $(printf '%-11s' "$label:") ${GREEN}running${NC}"
         else
-            echo -e "  ${svc^}:$(printf '%*s' $((10 - ${#svc})) '') ${RED}stopped${NC}"
+            echo -e "  $(printf '%-11s' "$label:") ${RED}stopped${NC}"
         fi
     done
     if [[ -f nexus.db ]]; then
@@ -294,6 +434,13 @@ show_status() {
 }
 
 # ── Main ────────────────────────────────────────────────────────────────
+# Subcommand dispatch. `${1:-}` tolerates no argument under `set -u`, and the
+# catch-all `*` means both a bare `./dev.sh` and any unrecognised word run the
+# full startup — there is intentionally no "unknown command" error.
+#
+# Note the per-subcommand preflight: `api` loads env + installs Python but
+# skips docker/node checks, `ui` only installs frontend deps. Only `infra` and
+# the default path run the full check_deps.
 case "${1:-}" in
     stop)   stop_all ;;
     infra)  check_deps; start_infra ;;

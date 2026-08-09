@@ -18,6 +18,15 @@ frontend/dist/
 .mypy_cache/
 .pytest_cache/
 
+# Test artifacts
+.coverage
+htmlcov/
+coverage/
+frontend/coverage/
+frontend/test-results/
+frontend/playwright-report/
+frontend/.pw-tmp/
+
 # Runtime artifacts
 .nexus-*
 *.log
@@ -29,3 +38,6 @@ frontend/dist/
 
 # Per-job result uploads
 .nexus-results/
+
+# Generated knowledge-graph output (regenerate with `graphify update .`)
+graphify-out/

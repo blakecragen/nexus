@@ -1,3 +1,32 @@
+/**
+ * Storage.tsx — artifact storage backend administration (route `/storage`).
+ *
+ * Role in the system:
+ *   Job artifacts (build outputs, gem5 result tarballs, etc.) are persisted to
+ *   pluggable storage backends — MinIO, an S3 bucket, a NAS mount, or Google
+ *   Drive. This page is the operator UI for registering those backends,
+ *   health-checking them, deleting them, and reviewing artifact transfers
+ *   between them.
+ *
+ * Data flow:
+ *   - `useStorageStore`      -> GET /api/storage/backends
+ *   - `useCredentialsStore`  -> GET /api/credentials (populates the credential
+ *     picker; the actual secrets stay server-side and are only referenced by id)
+ *   - Transfers are held in local state, not a store:
+ *     GET /api/storage/transfers
+ *   - Mutations via `api` (`frontend/src/api/client.ts`):
+ *       POST   /api/storage/backends
+ *       DELETE /api/storage/backends/{id}
+ *       GET    /api/storage/backends/{id}/health
+ *
+ * Neighbours: credentials themselves are managed on `Admin.tsx`; the backend
+ * chosen here is what `JobDetail.tsx` ultimately downloads results from.
+ *
+ * AI Note: nothing on this page auto-refreshes. Health results, backend usage
+ * and the transfer table are all point-in-time snapshots taken on mount or on
+ * explicit user action — there is no polling and no WebSocket channel for
+ * storage events.
+ */
 import { useEffect, useState, useCallback } from "react";
 import {
   Plus,
@@ -16,6 +45,17 @@ import { api } from "@/api/client";
 import { cn, formatBytes } from "@/lib/utils";
 import type { StorageBackendInfo, TransferInfo } from "@/types";
 
+/**
+ * Icon + colour per backend type, keyed by the LOWERCASED `backend_type`
+ * string the server returns.
+ *
+ * AI Note: the keys must stay lowercase — {@link typeBadge} looks them up with
+ * `.toLowerCase()`. Adding a backend type on the server without a matching key
+ * here is safe (it falls back to a neutral drive icon) but visually
+ * indistinguishable from the other unknown types. The `Add Storage Backend`
+ * form's `<option>` values are the authoritative list of what the UI can
+ * create.
+ */
 const BACKEND_TYPE_META: Record<string, { icon: React.ElementType; color: string }> = {
   minio: { icon: HardDrive, color: "bg-orange-100 text-orange-700" },
   nas: { icon: Server, color: "bg-purple-100 text-purple-700" },
@@ -23,6 +63,14 @@ const BACKEND_TYPE_META: Record<string, { icon: React.ElementType; color: string
   gdrive: { icon: FolderSync, color: "bg-green-100 text-green-700" },
 };
 
+/**
+ * Renders the type pill (icon + label) for a storage backend card.
+ *
+ * @param backendType raw `backend_type` from the API; matched
+ *   case-insensitively against {@link BACKEND_TYPE_META}, with an unknown type
+ *   falling back to a neutral drive icon rather than crashing.
+ * @returns JSX, not a component — inlined directly into the card.
+ */
 function typeBadge(backendType: string) {
   const meta = BACKEND_TYPE_META[backendType.toLowerCase()] ?? {
     icon: HardDrive,
@@ -42,6 +90,16 @@ function typeBadge(backendType: string) {
   );
 }
 
+/**
+ * Renders the coloured status pill for one row of the transfers table.
+ *
+ * @param status server-side transfer status: `pending`, `in_progress`,
+ *   `completed` or `failed`.
+ *
+ * AI Note: the label is `status.replace("_", " ")` (first underscore only), so
+ * `in_progress` displays as "in progress". A future status with two
+ * underscores would only have the first one replaced.
+ */
 function transferStatusBadge(status: string) {
   const colors: Record<string, string> = {
     pending: "bg-yellow-100 text-yellow-700",
@@ -61,6 +119,25 @@ function transferStatusBadge(status: string) {
   );
 }
 
+/**
+ * Usage meter for a storage backend card.
+ *
+ * Two rendering modes:
+ *   - No declared capacity (`capacity_bytes` null/0): a single text line
+ *     "Used: X / Unknown capacity" with no bar, because a percentage would be
+ *     meaningless.
+ *   - Known capacity: a used/total line plus a bar that turns yellow above 70%
+ *     and red above 90%.
+ *
+ * @param backend the backend whose `used_bytes` / `capacity_bytes` are shown.
+ *
+ * AI Note: the falsy check on `capacity_bytes` also catches an explicit 0,
+ * which is intentional — a zero-capacity backend would otherwise divide by
+ * zero and produce `Infinity`/`NaN` in the width style.
+ *
+ * AI Note: 70 and 90 are the warn/critical thresholds and `Math.min(100, ...)`
+ * clamps over-provisioned backends so the bar can never overflow its track.
+ */
 function CapacityBar({ backend }: { backend: StorageBackendInfo }) {
   if (!backend.capacity_bytes) {
     return (
@@ -92,6 +169,31 @@ function CapacityBar({ backend }: { backend: StorageBackendInfo }) {
   );
 }
 
+/**
+ * Storage administration page.
+ *
+ * What the user sees:
+ *   1. Header with an "Add Backend" button that opens a modal form.
+ *   2. A responsive grid of backend cards: name, "Default" star, type pill, an
+ *      optional health dot (only after the user clicks Test), a
+ *      {@link CapacityBar}, the scheduling `priority`, and Test/Delete buttons.
+ *   3. A "Recent Transfers" table (artifact, source -> dest, status, bytes
+ *      moved, error).
+ *   4. The Add Backend modal, mounted only while `showAddDialog` is true.
+ *
+ * State groups:
+ *   - Backends/credentials come from Zustand stores; `transfers` is local.
+ *   - `healthResults` maps backend id -> healthy boolean. A key being
+ *     *absent* means "never tested" (no dot is rendered), which is why the
+ *     card checks `health !== undefined` rather than truthiness.
+ *   - `testingId` / `deletingId` hold the id of the row with an in-flight
+ *     request so only that row shows a spinner.
+ *   - The `form*` fields are the Add Backend modal's controlled inputs; they
+ *     live here rather than in a child component, so they persist if the modal
+ *     is closed and reopened without a successful submit.
+ *
+ * Props: none — routed component.
+ */
 export default function Storage() {
   const { backends, isLoading, fetch } = useStorageStore();
   const { credentials, fetch: fetchCreds } = useCredentialsStore();
@@ -112,6 +214,12 @@ export default function Storage() {
   const [formSubmitting, setFormSubmitting] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
 
+  // Mount-only load of backends, credentials and transfers.
+  //
+  // AI Note: transfers are fetched with a raw promise chain (not through a
+  // store) and the `.catch(() => {})` deliberately swallows failures — the
+  // transfers endpoint is secondary, and a failure there must not blank the
+  // backend cards. The consequence is a silent empty table if it 500s.
   useEffect(() => {
     fetch();
     fetchCreds();
@@ -123,6 +231,20 @@ export default function Storage() {
       .finally(() => setTransfersLoading(false));
   }, [fetch, fetchCreds]);
 
+  /**
+   * Runs an on-demand reachability probe against one backend
+   * (GET /api/storage/backends/{id}/health) and records the result in
+   * `healthResults`, which lights the green/red dot on that card.
+   *
+   * AI Note: a thrown request (network error, 5xx) is recorded as
+   * `healthy: false` — i.e. "could not verify" is presented to the operator as
+   * "unhealthy". That conflation is deliberate for an ops dashboard, but it
+   * means a red dot does not distinguish "backend is down" from "the Nexus
+   * server could not run the check".
+   *
+   * Results are never cleared, so a stale green dot can persist after a
+   * backend goes down; re-click Test to refresh.
+   */
   const handleTest = useCallback(async (id: string) => {
     setTestingId(id);
     try {
@@ -135,6 +257,21 @@ export default function Storage() {
     }
   }, []);
 
+  /**
+   * Deletes a storage backend after a native `confirm()` prompt, then reloads
+   * the backend list.
+   *
+   * AI Note: this uses the browser's blocking `window.confirm` rather than the
+   * custom modal used elsewhere in the app (Jobs, Nodes, Pools). It is the odd
+   * one out; if this page gains a design pass, this is the thing to replace.
+   *
+   * AI Note: deleting a backend does not delete the artifacts stored on it —
+   * the server only drops the registration. Existing artifacts pointing at the
+   * removed backend become undownloadable.
+   *
+   * Errors are swallowed (the api client already redirects on 401); the list
+   * simply refetches unchanged.
+   */
   const handleDelete = useCallback(async (id: string) => {
     if (!confirm("Delete this storage backend? This cannot be undone.")) return;
     setDeletingId(id);
@@ -148,6 +285,31 @@ export default function Storage() {
     }
   }, []);
 
+  /**
+   * Submits the Add Backend modal: parses the free-form JSON config, POSTs
+   * /api/storage/backends, refetches the list and resets the form.
+   *
+   * The `config` blob is backend-type specific (endpoint/bucket for MinIO and
+   * S3, a mount path for NAS, and so on) and is passed through to the server
+   * verbatim — the UI does no schema validation beyond "is it JSON".
+   *
+   * AI Note: the JSON parse failure path returns early *after* manually
+   * clearing `formSubmitting`, because it sits before the try/finally that
+   * would otherwise do it. Any new early return added here must do the same or
+   * the submit button stays disabled forever.
+   *
+   * AI Note: `credential_id` is sent as `undefined` (omitted) when "None" is
+   * selected, and `capacity_bytes` as explicit `null` when blank — two
+   * different "absent" encodings that the server treats the same way. Do not
+   * "normalise" one to the other without checking the API schema.
+   *
+   * AI Note: setting `is_default` on a new backend implicitly demotes whatever
+   * backend was default before; that reassignment happens server-side, which
+   * is why the local list is refetched rather than patched.
+   *
+   * The form is only reset on success, so a failed submit preserves the
+   * operator's input.
+   */
   const handleAddBackend = useCallback(
     async (e: React.FormEvent) => {
       e.preventDefault();
@@ -234,6 +396,10 @@ export default function Storage() {
                     {typeBadge(b.backend_type)}
                   </div>
                   <div className="flex items-center gap-1">
+                    {/* AI Note: `!== undefined` (not truthiness) — an untested
+                        backend has no key in `healthResults` and shows no dot,
+                        whereas a tested-and-failing backend is `false` and must
+                        show a red one. */}
                     {health !== undefined && (
                       <span
                         className={cn(
@@ -330,6 +496,10 @@ export default function Storage() {
               ) : (
                 transfers.map((t) => (
                   <tr key={t.id}>
+                    {/* AI Note: ids are truncated to 8 chars purely for
+                        display width. They are UUID prefixes, not stable
+                        short-ids — never use these strings to look a record
+                        back up. */}
                     <td className="px-4 py-3 font-mono text-xs">
                       {t.artifact_id.slice(0, 8)}...
                     </td>

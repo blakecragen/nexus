@@ -47,6 +47,21 @@ import urllib.error
 import urllib.request
 
 # ── pretty output ───────────────────────────────────────────────────────────
+# Tiny logging shim. Deliberately not the `logging` module: this is an operator
+# facing CLI whose entire value is a readable, colourised transcript.
+#
+# _TTY : True when stdout is a terminal. Colour codes are suppressed otherwise
+#        so piping/redirecting the output (or capturing it from add_node.sh in
+#        CI) yields clean, escape-free text.
+# _c   : wrap `s` in ANSI colour `code`, or return it unchanged when not a TTY.
+# info : progress step, to stdout.
+# ok   : success step, to stdout.
+# warn : non-fatal problem, to STDERR (so it survives stdout redirection).
+# die  : fatal error to stderr, then exit(1). Never returns.
+#
+# AI Note: `die()` calls sys.exit(1), so callers below treat it as terminal and
+# do not guard afterwards. It is also used *inside* the `try:` in main(); the
+# resulting SystemExit still runs the `finally:` that closes the SSH client.
 _TTY = sys.stdout.isatty()
 def _c(code, s): return f"\033[{code}m{s}\033[0m" if _TTY else s
 def info(m): print(_c("34", "==>"), m)
@@ -56,6 +71,27 @@ def die(m):  print(_c("31", "err"), m, file=sys.stderr); sys.exit(1)
 
 # ── HTTP helpers (stdlib) ───────────────────────────────────────────────────
 def _req(method, url, token=None, body=None, timeout=15):
+    """Issue a JSON HTTP request against the Nexus API using only the stdlib.
+
+    Deliberately avoids `requests`/`httpx`: this script must run under whatever
+    python3 happens to have paramiko installed (see add_node.sh), so it may not
+    have the project's dependencies available.
+
+    Args:
+        method: HTTP verb.
+        url: absolute URL.
+        token: optional bearer token for authenticated endpoints.
+        body: optional object, JSON-encoded as the request body.
+        timeout: socket timeout in seconds.
+
+    Returns:
+        (status_code, parsed_body_or_None). An empty response body yields None.
+
+    AI Note: HTTPError is caught and downgraded to `(code, None)` — the error
+    body is intentionally discarded, so callers can only report the status.
+    Connection-level failures (server down, DNS) are NOT caught here and will
+    propagate as URLError.
+    """
     data = json.dumps(body).encode() if body is not None else None
     headers = {"Content-Type": "application/json"}
     if token:
@@ -69,12 +105,42 @@ def _req(method, url, token=None, body=None, timeout=15):
         return e.code, None
 
 def api_login(api, user, pw):
+    """Exchange admin credentials for a bearer token; die() on failure.
+
+    Node registration requires the admin role, so every non-``--register-only``
+    path starts here.
+
+    Args:
+        api: API base URL (e.g. http://localhost:8000).
+        user, pw: admin credentials (from --admin-user/--admin-pass or env).
+
+    Returns:
+        The access token string.
+    """
     st, body = _req("POST", f"{api}/api/auth/login", body={"username": user, "password": pw})
     if st != 200 or not body:
         die(f"Login failed (HTTP {st}). Is the API up at {api}? Are admin creds right?")
     return body["access_token"]
 
 def api_register(api, token, hostname, name):
+    """Create the node record and mint its agent API key.
+
+    Args:
+        api: API base URL.
+        token: admin bearer token from api_login().
+        hostname: SSH host, stored as the node's hostname.
+        name: friendly display name shown in the dashboard.
+
+    Returns:
+        (node_id, api_key) — the UUID the agent dials back with, and the shared
+        secret it authenticates with.
+
+    AI Note: the hardware fields below are deliberate PLACEHOLDERS
+    ("pending"/"unknown"/0.0.0.0/1 core/1024 MB), not real detection. The agent
+    overwrites them with the true specs on its first heartbeat. Consequence: a
+    freshly registered node briefly shows bogus specs in the dashboard, and a
+    node that never comes online keeps showing them forever.
+    """
     body = {
         "hostname": hostname, "display_name": name, "os_type": "linux",
         "os_version": "unknown", "arch": "unknown", "cpu_model": "pending",
@@ -87,10 +153,25 @@ def api_register(api, token, hostname, name):
     return b["node"]["id"], b["api_key"]
 
 def api_status(api, token, node_id):
+    """Read a node's current status string, for the post-install online poll.
+
+    Returns the status (e.g. "online"/"offline") or a ``"http <code>"`` marker
+    on failure — a sentinel string rather than an exception, because the caller
+    polls this in a loop and only cares whether it has become "online" yet.
+    """
     st, b = _req("GET", f"{api}/api/nodes/{node_id}", token=token)
     return b.get("status") if (st == 200 and b) else f"http {st}"
 
 # ── remote-python resolution (run on remote) ────────────────────────────────
+# Shell snippet executed on the REMOTE host to locate a Python >= 3.11 (the
+# agent packages' floor). Prints the first usable interpreter path and exits 0,
+# or exits 1 if none is found.
+#
+# AI Note: bare names are probed before Homebrew/local paths so a PATH-managed
+# interpreter (pyenv, conda, distro) wins. The `case` glob is the version gate:
+# "3.1[1-9]" matches 3.11-3.19 and "3.[2-9]*" matches 3.2x+ — string globbing is
+# used because there is no reliable numeric comparison in portable /bin/sh.
+# Note that 3.1x versions above 3.19 (e.g. a future 3.110) would NOT match.
 RESOLVE_PY = r'''
 for p in python3.13 python3.12 python3.11 \
          /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3.12 /opt/homebrew/bin/python3.11 \
@@ -104,6 +185,34 @@ exit 1
 '''
 
 # Args: PY RD REPO_URL BRANCH WS KEY NID MODE
+#
+# The full remote installer, uploaded to /tmp/nexus-install.sh over SFTP and run
+# with bash. Everything it needs arrives as positional args (quoted by _q) so no
+# secrets are baked into the file contents:
+#   $1 PY       python >=3.11 interpreter path resolved by RESOLVE_PY
+#   $2 RD       install/clone directory, relative to the remote $HOME
+#   $3 REPO_URL git repo to clone (the device pulls its own code)
+#   $4 BRANCH   branch to check out
+#   $5 WS       ws:// URL the agent dials back to
+#   $6 KEY      node api_key (written 0600 into ~/.nexus-agent/config.json)
+#   $7 NID      node UUID
+#   $8 MODE     "service" (launchd/systemd) or anything else -> background
+#
+# Distinct non-zero exits let the caller distinguish failures: 3 = git missing,
+# 5 = agent started but died, 6 = --service on an unsupported OS.
+#
+# AI Note: `set -e` is on, but many teardown/compat lines end in
+# `|| true` — that is deliberate. Stopping a prior instance, unloading a launchd
+# job, or disabling a systemd unit all fail harmlessly on a first-time install,
+# and must not abort the run.
+#
+# AI Note: the script is idempotent by design (re-running it updates an existing
+# checkout, recreates the venv, stops the previous agent, then restarts). That
+# is what makes the "Bring Online"/reconnect flow in the UI safe to retry.
+#
+# AI Note: the `sleep 3` before the status check is a deliberate settle window —
+# the agent needs a moment to either connect or crash. Too short and a healthy
+# agent is reported as AGENT_DIED; the caller has no other liveness signal.
 INSTALL_SH = r'''#!/bin/bash
 set -e
 PY="$1"; RD="$2"; REPO_URL="$3"; BRANCH="$4"; WS="$5"; KEY="$6"; NID="$7"; MODE="$8"
@@ -212,6 +321,20 @@ fi
 '''
 
 def main():
+    """CLI entry point: parse args, then run the register-only or full SSH flow.
+
+    Full flow ordering (SSH-first, register-last) is a deliberate invariant:
+      1. connect over SSH and pick a controller address the remote can reach
+      2. verify git + a Python >= 3.11 exist on the device
+      3. ONLY THEN register the node (which mints a UUID + api_key)
+      4. upload and run INSTALL_SH (clone, venv, install, configure, start)
+      5. poll the API until the node reports online
+      6. print management hints
+
+    AI Note: steps 1-3 are ordered this way so a device that fails preflight
+    never leaves an orphan node record in the database. If the install itself
+    fails after registration, `_cleanup()` deregisters the node explicitly.
+    """
     ap = argparse.ArgumentParser(add_help=True, description="Register + set up a Nexus node over SSH.")
     ap.add_argument("target", help="user@host")
     ap.add_argument("password", nargs="?", default=None, help="SSH password (optional)")
@@ -239,6 +362,9 @@ def main():
     rd = args.remote_dir
 
     # ── register-only: HTTP-only path, no SSH ──
+    # Mints the node record and prints the credentials for manual setup. Useful
+    # when the device can't be reached over SSH from here (NAT, jump host, or a
+    # Windows box) — someone runs `nexus-agent run ...` on it by hand.
     if args.register_only:
         ws_host = args.ws_host or _default_ws_host()
         info(f"Logging in to {args.api} as '{args.admin_user}'")
@@ -265,6 +391,9 @@ def main():
 
     pw = None
     if not args.key:
+        # Password precedence: CLI arg > $NEXUS_SSH_PASSWORD > $SSHPASS > prompt.
+        # AI Note: the non-TTY branch must die() rather than prompt — otherwise
+        # a CI/sandbox invocation would block forever on stdin.
         pw = args.password or os.environ.get("NEXUS_SSH_PASSWORD") or os.environ.get("SSHPASS")
         if not pw:
             if sys.stdin.isatty():
@@ -273,12 +402,20 @@ def main():
                 die("No password given. Pass it as the 2nd arg, set $NEXUS_SSH_PASSWORD, or use --key.")
 
     client = paramiko.SSHClient()
+    # AI Note: AutoAddPolicy accepts any host key without verification, which
+    # disables SSH MITM protection. Accepted deliberately for first-contact
+    # provisioning of lab machines on a trusted LAN; do NOT reuse this pattern
+    # for connections over untrusted networks.
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     info(f"Connecting to {args.target} ({'key' if args.key else 'password'} auth)")
     try:
         if args.key:
             client.connect(host, username=user, timeout=20)
         else:
+            # AI Note: look_for_keys/allow_agent are disabled in password mode
+            # on purpose. Otherwise paramiko tries every agent identity first
+            # and can exhaust the server's MaxAuthTries before ever attempting
+            # the password, producing a misleading "authentication failed".
             client.connect(host, username=user, password=pw, timeout=20,
                            look_for_keys=False, allow_agent=False)
     except Exception as e:
@@ -286,6 +423,16 @@ def main():
     ok("Connected.")
 
     def run(cmd, timeout=600):
+        """Run `cmd` on the connected remote host and wait for it to finish.
+
+        Returns:
+            (exit_code, stdout, stderr) with the streams fully read and decoded.
+
+        AI Note: `recv_exit_status()` blocks until the command completes, so
+        this is strictly synchronous — fine here, but it means a remote command
+        that never exits hangs the deploy despite the `timeout` (which only
+        bounds socket reads, not total runtime).
+        """
         _in, out, err = client.exec_command(cmd, timeout=timeout)
         rc = out.channel.recv_exit_status()
         return rc, out.read().decode(), err.read().decode()
@@ -295,6 +442,13 @@ def main():
     try:
         # 1. Pick the controller address the REMOTE can actually reach (auto,
         #    unless --ws-host was given). Handles multi-homed controllers.
+        #
+        # AI Note: reachability is probed FROM the remote (curl runs there), not
+        # from here — the whole point is that the controller's own view of its
+        # address (often 127.0.0.1) is useless to the agent. curl's "000" means
+        # "no HTTP response at all"; ANY real status (including 401/404) proves
+        # the address is routable, which is why the check is `c != "000"` rather
+        # than a 2xx check.
         candidates = [args.ws_host] if args.ws_host else (_local_ipv4s() or ["localhost"])
         chosen = None
         for cand in candidates:
@@ -327,9 +481,13 @@ def main():
                 brew = _first_path(run, ["/opt/homebrew/bin/brew", "/usr/local/bin/brew", "brew"])
                 if not brew:
                     die("Homebrew not found on remote.")
+                # AI Note: 1800s (30 min) — a from-source brew build of Python
+                # on an older Mac genuinely takes this long. Do not lower it to
+                # the default 600s or slow machines fail mid-compile.
                 rc, o, e = run(f"{brew} install python@3.12", timeout=1800)
                 if rc != 0:
                     die(f"brew install failed:\n{e or o}")
+                # Re-resolve: brew's new interpreter should now be discoverable.
                 rc, o, _ = run(f"bash -c {_q(RESOLVE_PY)}")
                 py = o.strip() if rc == 0 else ""
             if not py:
@@ -357,19 +515,33 @@ def main():
             f.write(INSTALL_SH); local_sh = f.name
         sftp.put(local_sh, "/tmp/nexus-install.sh")
         sftp.close()
+        # AI Note: the api_key is passed as a command ARGUMENT, so it is briefly
+        # visible in the remote process list (`ps`) during the install. The
+        # installer immediately persists it 0600 in ~/.nexus-agent/config.json.
+        # Every argument goes through _q() — unquoted interpolation here would
+        # be a shell-injection hole on hostnames/branches/paths.
+        # AI Note: 1200s (20 min) covers the clone + venv + three pip installs
+        # on a slow or bandwidth-limited device.
         rc, o, e = run(f"bash /tmp/nexus-install.sh {_q(py)} {_q(rd)} {_q(args.repo_url)} "
                        f"{_q(args.branch)} {_q(ws_url)} {_q(api_key)} {_q(node_id)} {_q(mode)}",
                        timeout=1200)
         print("    " + "\n    ".join((o or "").strip().splitlines()))
         if rc != 0:
             warn((e or "").strip())
+            # Roll back the registration so a failed install leaves no orphan.
             _cleanup(args.api, token, node_id)
             die("Remote setup failed (node deregistered).")
         ok(f"Agent installed + started on remote ({mode}).")
     finally:
+        # AI Note: `finally` (not a context manager) because die() raises
+        # SystemExit from several branches above — the SSH connection must be
+        # closed on every exit path, including those.
         client.close()
 
     # 7. Wait for online
+    # Poll for up to ~30s (15 attempts x 2s) for the agent's first heartbeat.
+    # A timeout is NOT fatal: the agent may still connect moments later, so we
+    # warn with troubleshooting hints instead of failing the deploy.
     info("Waiting for node to report online…")
     status = "unknown"
     for _ in range(15):
@@ -402,11 +574,29 @@ def main():
               f"  Remove:  curl -X DELETE {args.api}/api/nodes/{node_id} -H 'Authorization: Bearer <token>'")
 
 def _q(s):
-    """Single-quote a string for safe shell embedding."""
+    """Single-quote a string for safe shell embedding.
+
+    Wraps `s` in single quotes and escapes any embedded single quote using the
+    standard ``'"'"'`` idiom (close-quote, quoted-quote, reopen-quote).
+
+    AI Note: security-relevant. Every value interpolated into a remote command
+    (paths, hostnames, branch names, the api_key) must pass through this, or a
+    crafted value could break out of the quoting and execute arbitrary commands
+    on the target host as the SSH user.
+    """
     return "'" + str(s).replace("'", "'\"'\"'") + "'"
 
 def _default_ws_host():
-    """Best-effort primary LAN IP the remote agent can dial back to."""
+    """Best-effort primary LAN IP the remote agent can dial back to.
+
+    Used only by the ``--register-only`` path (the SSH path uses the
+    remote-verified `_local_ipv4s()` probe instead).
+
+    AI Note: the UDP "connect" to 8.8.8.8 sends NO packets — it just asks the
+    kernel which local interface would be used for that route, which is the
+    portable way to find the primary outbound IP. It works with no internet
+    connectivity, but it does need a default route; falls back to "localhost".
+    """
     import socket
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -419,7 +609,18 @@ def _default_ws_host():
 
 def _local_ipv4s():
     """All controller IPv4 addresses, default-route first — candidates for the
-    address the remote agent should dial back to."""
+    address the remote agent should dial back to.
+
+    Ordering matters: the default-route address is tried first because it is the
+    most likely to be reachable; the remaining interfaces (from `ifconfig`, or
+    `ip -4 addr` on hosts without it) cover multi-homed controllers on separate
+    lab VLANs.
+
+    AI Note: loopback (127.*) and link-local (169.254.*) are filtered out
+    because an agent on another machine can never reach them — offering them as
+    candidates would waste a probe and could "succeed" misleadingly if the
+    remote happened to run something on that port locally.
+    """
     import socket, subprocess, re
     ips = []
     try:
@@ -439,6 +640,15 @@ def _local_ipv4s():
     return [ip for ip in ips if not ip.startswith(("127.", "169.254."))]
 
 def _first_path(run, candidates):
+    """Return the first candidate binary that exists on the REMOTE host.
+
+    Args:
+        run: the closure from main() that executes a command over SSH.
+        candidates: paths/names to probe in priority order.
+
+    Returns:
+        The first candidate resolvable via `command -v`, else None.
+    """
     for c in candidates:
         rc, _, _ = run(f"command -v {_q(c)}")
         if rc == 0:
@@ -446,7 +656,13 @@ def _first_path(run, candidates):
     return None
 
 def _cleanup(api, token, node_id):
-    """Deregister a node we created but couldn't bring up, to avoid orphans."""
+    """Deregister a node we created but couldn't bring up, to avoid orphans.
+
+    AI Note: failures are swallowed on purpose. This runs on an error path that
+    is about to die() with the real reason; a secondary exception here (API now
+    unreachable, token expired) would mask the diagnosis the operator needs.
+    Worst case the node record is left behind and must be deleted by hand.
+    """
     try:
         _req("DELETE", f"{api}/api/nodes/{node_id}", token=token)
     except Exception:

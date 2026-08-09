@@ -15,10 +15,25 @@
 # SSH, no pseudo-terminal) so password auth works non-interactively. Requires
 # paramiko for the python3 on PATH:  pip3 install paramiko
 #
+# Role: this script contains NO logic of its own. Its only job is interpreter
+# selection — every flag is forwarded verbatim to nexus_deploy.py, which is the
+# real implementation (register the node via the API, then clone + install +
+# start the agent on the device over SSH).
+#
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Prefer a python3 that actually has paramiko (system python often does; the
 # project .venv usually doesn't).
+#
+# AI Note: this loop exists because of an easy-to-hit trap — if the project
+# .venv is active, `python3` resolves to it, and the venv installs only the
+# server/agent packages (paramiko is not among them). Probing with an actual
+# `import paramiko` rather than checking version/paths is what makes the choice
+# reliable regardless of which environment happens to be active.
+#
+# AI Note: `exec` replaces this shell with python, so the deploy script's exit
+# code and signal handling (Ctrl-C during a long install) pass straight through
+# to the caller. "$@" is quoted so arguments containing spaces survive intact.
 for PY in python3 /usr/bin/python3 /opt/homebrew/bin/python3; do
   if command -v "$PY" >/dev/null 2>&1 && "$PY" -c 'import paramiko' >/dev/null 2>&1; then
     exec "$PY" "$DIR/nexus_deploy.py" "$@"

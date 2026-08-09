@@ -9,6 +9,26 @@ host and container — and the produced stats.txt lands back on the host.
 
 stdout/stderr and the m5out stats directory are captured; ``LARGE_OUTPUT = True``
 signals the storage manager to prefer high-capacity backends for the artifacts.
+
+Where this fits
+---------------
+Registered as ``"gem5_run_simulation"``. Sits between
+``docker_ensure_container`` (which publishes ``container`` + ``docker`` into the
+job context, both of which this step picks up automatically via
+``ctx.resolve()``) and ``gem5_collect_results`` (which consumes the
+``m5out_path`` and ``container`` this step publishes).
+
+The two execution modes
+-----------------------
+Direct mode: gem5 runs as a normal child of the agent; ``m5out`` is a host
+tempdir; ``cwd`` is a host path.
+
+Container mode: the agent's child is the **docker client**, not gem5. Every
+gem5-visible path (binary, config script, working_dir, m5out) is a
+*container* path, so the host process must never stat, mkdir or chdir into
+them — that is why ``host_cwd`` is ``None`` and the m5out directory is created
+with ``docker exec ... mkdir -p`` rather than ``tempfile.mkdtemp``. This
+distinction is the single largest source of bugs in this file; preserve it.
 """
 
 from __future__ import annotations
@@ -29,6 +49,22 @@ from nexus_common.steps.registry import register
 
 
 def _find_docker(explicit: str | None) -> str | None:
+    """Locate the ``docker`` CLI on this node.
+
+    Args:
+        explicit: A caller-supplied path, returned as-is without validation.
+
+    Returns:
+        Path to a docker binary, or ``None`` if none was found.
+
+    AI Note: the PATH lookup alone is insufficient because agents typically run
+    as a LaunchAgent/systemd unit with a minimal PATH that omits
+    ``/usr/local/bin`` and ``/opt/homebrew/bin``; the hardcoded candidates are
+    the workaround (the last is Docker Desktop's in-bundle binary on macOS).
+
+    AI Note: duplicated verbatim in ``nexus_steps.docker.ensure_container`` and
+    ``nexus_steps.gem5.collect_results``. Keep all three in sync.
+    """
     if explicit:
         return explicit
     found = shutil.which("docker")
@@ -49,7 +85,13 @@ def _find_docker(explicit: str | None) -> str | None:
 
 
 class RunSimulationParams(BaseModel):
-    """Parameters for the gem5_run_simulation step."""
+    """Parameters for the gem5_run_simulation step.
+
+    ``container`` and ``docker`` are normally left unset and resolved from the
+    upstream ``docker_ensure_container`` step's outputs. The
+    ``description``/``examples`` text is user-facing via ``to_schema()`` →
+    ``/api/steps``.
+    """
 
     gem5_binary: str | None = Field(
         None,
@@ -100,15 +142,27 @@ class RunSimulationParams(BaseModel):
 
 @register("gem5_run_simulation")
 class RunSimulationStep(FlowStep):
-    """Run a gem5 architectural simulation."""
+    """Run a gem5 architectural simulation.
+
+    Simulations routinely run for hours; the step is asynchronous (detached
+    child + polled ``check()``) so the agent stays responsive throughout.
+    """
 
     PARAMS_SCHEMA = RunSimulationParams
+    # AI Note: ``m5out_path`` and ``container`` are exported specifically so a
+    # chained ``gem5_collect_results`` can resolve them from context without the
+    # user repeating them. Removing either breaks that auto-wiring.
     OUTPUT_KEYS = ["exit_code", "stats_artifact_id", "m5out_path", "container"]
     DESCRIPTION = "Run a gem5 simulation and collect results."
 
     SUPPORTED_OS = ["macos", "linux"]
+    # Hint to the storage manager: prefer high-capacity backends for artifacts.
     LARGE_OUTPUT = True
 
+    # AI Note: the macOS default points at an ARM gem5 build, which in practice
+    # only exists on a node with a native macOS gem5. Container mode is the
+    # usual macOS route, and there this path is interpreted INSIDE the container
+    # — so the OS variant is frequently overridden in the job definition.
     OS_VARIANTS = {
         "macos": {"gem5_binary": "/opt/gem5/build/ARM/gem5.opt"},
         "linux": {"gem5_binary": "/usr/local/bin/gem5.opt"},
@@ -117,9 +171,38 @@ class RunSimulationStep(FlowStep):
     # ── Lifecycle ──
 
     def startup(self, params: dict[str, Any], ctx: StepContext) -> dict[str, Any]:
+        """Build the gem5 command for the selected mode and launch it detached.
+
+        Args:
+            params: Raw step params (already OS-resolved by the executor).
+            ctx: Job context; ``ctx.resolve()`` supplies ``container``/``docker``
+                published by an upstream ``docker_ensure_container``.
+
+        Returns:
+            A JSON-serialisable state dict: ``pid`` (of gem5, or of the docker
+            client in container mode), ``m5out_path``, ``container``,
+            ``docker``, ``stdout_path``, ``stderr_path``, ``timeout``,
+            ``collect_stats``, a ``stats_artifact_id`` placeholder filled in by
+            ``check()``, and the display-only ``_command_str``. On a
+            container-setup failure, an ``error``/``exit_code`` dict instead.
+
+        Side effects:
+            Creates the m5out directory (on the host, or inside the container),
+            creates two undeleted temp log files, and forks a long-running
+            process in a new session.
+
+        Raises:
+            pydantic.ValidationError: if ``config_script`` is missing.
+
+        AI Note: ``timeout`` is recorded in the state but nothing in this module
+        enforces it — neither ``startup()`` nor ``check()`` compares elapsed
+        time against it. A runaway simulation runs until the job is cancelled.
+        """
         resolved = ctx.resolve(params)
         validated = RunSimulationParams(**resolved)
 
+        # Last-resort default for when OS_VARIANTS did not apply (unknown OS
+        # string, or a direct unit-test call bypassing resolve_for_os()).
         binary = validated.gem5_binary or "/usr/local/bin/gem5.opt"
 
         if validated.container:
@@ -131,10 +214,18 @@ class RunSimulationStep(FlowStep):
             if not docker:
                 return {"error": "docker binary not found on node", "exit_code": -1}
             if not validated.working_dir:
+                # Required because the container m5out path is derived from it;
+                # os.getcwd() would be a host path and meaningless in-container.
                 return {"error": "working_dir is required when using `container`", "exit_code": -1}
             cwd = validated.working_dir
             # A unique m5out dir, relative to working_dir, created INSIDE the
             # container. Random suffix without host filesystem access.
+            #
+            # AI Note: uuid4 is used instead of tempfile.mkdtemp precisely
+            # because mkdtemp would create the directory on the HOST filesystem
+            # at a path that may not exist in the container. The 8-hex-char
+            # truncation is ample here — collisions only matter within one
+            # working_dir on one container.
             m5out_dir = f"{cwd.rstrip('/')}/m5out_nexus_{uuid.uuid4().hex[:8]}"
             mk = subprocess.run(
                 [docker, "exec", validated.container, "mkdir", "-p", m5out_dir],
@@ -144,11 +235,14 @@ class RunSimulationStep(FlowStep):
                 return {"error": f"could not create m5out in container: {mk.stderr.strip()}",
                         "exit_code": mk.returncode}
             inner = [binary, f"--outdir={m5out_dir}", validated.config_script, *validated.script_args]
+            # AI Note: no `-t`/`-i` on the exec — the child must be fully
+            # non-interactive with its stdio redirected to the temp log files.
             cmd = [docker, "exec", "-w", cwd, validated.container, *inner]
             host_cwd = None  # docker client runs from anywhere
         else:
             # Run gem5 directly on the node.
             cwd = validated.working_dir or os.getcwd()
+            # Host tempdir is correct here: gem5 itself runs on the host.
             m5out_dir = tempfile.mkdtemp(prefix="nexus_m5out_")
             cmd = [
                 binary,
@@ -158,6 +252,8 @@ class RunSimulationStep(FlowStep):
             ]
             host_cwd = cwd
 
+        # delete=False: these must survive startup() so the executor can read
+        # them back after the simulation exits.
         stdout_file = tempfile.NamedTemporaryFile(
             prefix="nexus_gem5_out_", suffix=".log", delete=False,
         )
@@ -165,6 +261,9 @@ class RunSimulationStep(FlowStep):
             prefix="nexus_gem5_err_", suffix=".log", delete=False,
         )
 
+        # start_new_session=True: own process group so cancel()'s killpg()
+        # reaches the whole tree. AI Note: in container mode that tree contains
+        # only the docker client — see the caveat on cancel().
         proc = subprocess.Popen(
             cmd,
             stdout=stdout_file,
@@ -180,16 +279,52 @@ class RunSimulationStep(FlowStep):
             "pid": proc.pid,
             "m5out_path": m5out_dir,
             "container": validated.container,
+            # AI Note: re-resolving docker here (rather than reusing the local
+            # `docker` variable) keeps this expression valid on the direct-mode
+            # branch where that variable was never bound. The value is
+            # persisted so check() and the downstream collect step do not have
+            # to re-run discovery.
             "docker": _find_docker(validated.docker) if validated.container else None,
             "stdout_path": stdout_file.name,
             "stderr_path": stderr_file.name,
             "timeout": validated.timeout,
             "collect_stats": validated.collect_stats,
             "stats_artifact_id": None,
+            # Display-only; read by StepExecutor._capture() for the job log.
             "_command_str": " ".join(cmd),
         }
 
     def check(self, state: dict[str, Any]) -> StepResult:
+        """Reap the simulation, verify stats.txt was produced, report status.
+
+        Args:
+            state: The ``startup()`` state dict; mutated in place to record
+                ``exit_code`` and (when found) ``stats_artifact_id``.
+
+        Returns:
+            ``RUNNING`` while gem5 is alive, ``SUCCESS`` on exit status 0,
+            ``FAILED`` on non-zero status or signal death.
+
+        Side effects:
+            In container mode, runs ``docker exec ... test -f`` to probe for the
+            stats file.
+
+        AI Note: the ``error`` branch must stay first — an error state (from a
+        container-setup failure in ``startup()``) has no ``pid`` and
+        ``state["pid"]`` would raise ``KeyError``.
+
+        AI Note: the stats probe is container-aware. A host ``os.path.isfile``
+        on a container path would report False even when the file exists (and
+        vice versa if a same-named host path happens to exist), so the
+        ``container`` branch must be kept.
+
+        AI Note: a missing stats.txt does NOT fail the step — only gem5's exit
+        code decides. ``stats_artifact_id`` simply stays ``None``, and the
+        downstream collect step is what will complain.
+        """
+        if "error" in state:
+            return StepResult.FAILED
+
         pid = state["pid"]
         try:
             result = os.waitpid(pid, os.WNOHANG)
@@ -200,6 +335,8 @@ class RunSimulationStep(FlowStep):
         if result == (0, 0):
             return StepResult.RUNNING
 
+        # WEXITSTATUS is only valid when WIFEXITED; a signal-killed simulation
+        # (SIGTERM from cancel(), OOM kill) reports -1 → FAILED.
         exit_status = os.WEXITSTATUS(result[1]) if os.WIFEXITED(result[1]) else -1
         state["exit_code"] = exit_status
 
@@ -217,11 +354,33 @@ class RunSimulationStep(FlowStep):
                 found = os.path.isfile(stats_path)
             if found:
                 # Placeholder until the storage manager uploads + returns an ID.
+                #
+                # AI Note: despite the name, this holds a filesystem PATH, not a
+                # storage-backend ID. Consumers that treat it as an opaque
+                # artifact handle will break once real uploads land. Actual
+                # artifact upload currently happens in ``gem5_collect_results``.
                 state["stats_artifact_id"] = stats_path
 
         return StepResult.SUCCESS if exit_status == 0 else StepResult.FAILED
 
     def cancel(self, state: dict[str, Any]) -> None:
+        """Best-effort graceful termination of the simulation's process group.
+
+        Args:
+            state: The ``startup()`` state dict; only ``pid`` is used. Safe on
+                an error state (no ``pid`` → no-op).
+
+        Side effects:
+            Sends ``SIGTERM`` to the child's process group.
+
+        AI Note: in CONTAINER mode the child is the docker client, not gem5.
+        Killing the client detaches the CLI but the ``docker exec`` payload —
+        the actual gem5 process — keeps running inside the container, burning
+        CPU and continuing to write into m5out. Fully cancelling a containerised
+        simulation additionally requires something like
+        ``docker exec <c> pkill -f gem5`` or a container restart; that is not
+        implemented here.
+        """
         pid = state.get("pid")
         if pid:
             try:

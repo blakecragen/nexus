@@ -1,3 +1,37 @@
+/**
+ * JobBuilder.tsx — visual pipeline composer (route `/jobs/new`).
+ *
+ * Role in the system:
+ *   The only place a job is created. It presents the server's registered step
+ *   types as a searchable palette, lets the user assemble an ordered list of
+ *   steps with per-step parameters, choose a target (pool or specific node) and
+ *   a priority, then POSTs the whole thing to /api/jobs.
+ *
+ * Data flow:
+ *   - `useStepsStore`  -> GET /api/steps — the step *schemas* (name,
+ *     description, supported OS, `requires_node`, and a `fields` array that
+ *     drives the dynamically generated parameter form).
+ *   - `usePoolsStore`  -> GET /api/pools  (target dropdown)
+ *   - `useNodesStore`  -> GET /api/nodes  (target dropdown, online only)
+ *   - `api.submitJob`  -> POST /api/jobs, then navigates to
+ *     `JobDetail.tsx` at `/jobs/{id}`.
+ *
+ * AI Note: the parameter form is entirely schema-driven — the frontend hard-codes
+ * no knowledge of any specific step. Adding a step type on the server makes it
+ * appear here automatically, provided its prefix is in {@link STEP_CATEGORIES}
+ * (otherwise it lands in "Other") and its field types are handled by
+ * {@link FieldInput} (otherwise they render as text inputs).
+ *
+ * AI Note: submit-time validation lives on the SERVER (it walks the step list
+ * accumulating each step's OUTPUT_KEYS so chained steps can reference upstream
+ * outputs). This page only checks "has a name" and "has at least one step" —
+ * do not duplicate the dependency-graph validation here, it will drift.
+ *
+ * Layout: three columns — palette (left), drag-and-drop canvas (centre),
+ * parameter editor + submit form (right). Drag-and-drop uses @dnd-kit for
+ * reordering within the canvas, and the native HTML5 drag API for palette ->
+ * canvas.
+ */
 import { useState, useEffect, useMemo, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import {
@@ -37,15 +71,33 @@ import type { StepSchemaInfo, FieldSchema } from "@/types";
 // Types
 // ---------------------------------------------------------------------------
 
+/**
+ * One step as held in the builder's local state.
+ *
+ * AI Note: `id` is a client-only handle used as the React key and the dnd-kit
+ * sortable id — it is NOT sent to the server and has no relationship to the
+ * `StepRun.id` that comes back on the job detail page. `step` is the schema
+ * name; `params` is the raw form state (which can contain empty strings that
+ * are stripped at submit time).
+ */
 interface BuilderStep {
   id: string;
   step: string;
   params: Record<string, unknown>;
 }
 
+/** Whether the job targets a whole pool or one specific node. */
 type TargetMode = "pool" | "node";
+/** User-facing priority labels; mapped to numbers by {@link PRIORITY_VALUES}. */
 type Priority = "high" | "normal" | "low";
 
+/**
+ * Label -> numeric priority sent as `priority` in the submit payload.
+ *
+ * AI Note: the server's scheduler orders the queue by this integer, HIGHER
+ * first. The 10/5/1 spacing is deliberate so intermediate values can be
+ * introduced later (or set via the API) without renumbering these three.
+ */
 const PRIORITY_VALUES: Record<Priority, number> = {
   high: 10,
   normal: 5,
@@ -56,6 +108,15 @@ const PRIORITY_VALUES: Record<Priority, number> = {
 // Category helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Palette section headings, keyed by the step name's underscore-delimited
+ * prefix (`shell_run` -> `shell` -> "Shell").
+ *
+ * AI Note: this is a display-only convention with no server counterpart — the
+ * backend does not tag steps with a category. A new step whose prefix is
+ * missing here silently lands in the "Other" bucket, which is a common cause of
+ * "my new step isn't showing up where I expected".
+ */
 const STEP_CATEGORIES: Record<string, string> = {
   shell: "Shell",
   flow: "Flow Control",
@@ -65,11 +126,29 @@ const STEP_CATEGORIES: Record<string, string> = {
   system: "System",
 };
 
+/**
+ * Maps a step name to its palette category via its prefix.
+ *
+ * @param stepName e.g. `"gem5_collect_results"`.
+ * @returns the display category, or `"Other"` for unknown prefixes. A name with
+ *   no underscore uses the whole name as the prefix.
+ */
 function categorize(stepName: string): string {
   const prefix = stepName.split("_")[0]?.toLowerCase() ?? "";
   return STEP_CATEGORIES[prefix] ?? "Other";
 }
 
+/**
+ * Buckets step schemas into palette sections.
+ *
+ * @param steps the (already search-filtered) schema list.
+ * @returns an object whose keys are categories in display order.
+ *
+ * AI Note: relies on JS object key insertion order to control the rendered
+ * section order — categories are inserted alphabetically with "Other" forced
+ * last. Do not swap this for a plain object literal or a `Map`-to-object
+ * conversion that loses that ordering.
+ */
 function groupSteps(
   steps: StepSchemaInfo[]
 ): Record<string, StepSchemaInfo[]> {
@@ -92,6 +171,19 @@ function groupSteps(
 // Build default params from schema
 // ---------------------------------------------------------------------------
 
+/**
+ * Seeds a new step's parameter object from its schema.
+ *
+ * @param schema the step schema fetched from GET /api/steps.
+ * @returns every declared field pre-populated: the schema default when there is
+ *   one, otherwise `false` for booleans and `""` for everything else.
+ *
+ * AI Note: every field is initialised (never left undefined) so the form inputs
+ * are controlled from the first render — React warns loudly when an input flips
+ * from uncontrolled to controlled. The empty-string placeholders are stripped
+ * again in `handleSubmit`, so "" never reaches the API. That also means a step
+ * whose legitimate value IS an empty string cannot express it through this UI.
+ */
 function buildDefaultParams(schema: StepSchemaInfo): Record<string, unknown> {
   const params: Record<string, unknown> = {};
   for (const f of schema.fields) {
@@ -110,7 +202,19 @@ function buildDefaultParams(schema: StepSchemaInfo): Record<string, unknown> {
 // Unique ID helper
 // ---------------------------------------------------------------------------
 
+/** Monotonic counter backing {@link uniqueId}; module-scoped so it survives
+ * component remounts within a session. */
 let _idCounter = 0;
+
+/**
+ * Generates a client-side id for a canvas step.
+ *
+ * AI Note: `Date.now()` alone is not sufficient — two steps added in the same
+ * millisecond (easy when clicking fast, or when a future "duplicate" action is
+ * added) would collide, and duplicate ids break both React keys and dnd-kit's
+ * sortable identity in confusing ways. The counter guarantees uniqueness; the
+ * timestamp is only there to keep ids readable/ordered.
+ */
 function uniqueId(): string {
   return `step-${Date.now()}-${++_idCounter}`;
 }
@@ -119,6 +223,12 @@ function uniqueId(): string {
 // OS badge color
 // ---------------------------------------------------------------------------
 
+/**
+ * Tailwind classes for the small OS chips on a palette item.
+ *
+ * @param os an entry from the schema's `supported_os` array.
+ * @returns a class pair; unknown values get neutral styling.
+ */
 function osBadgeClass(os: string): string {
   switch (os.toLowerCase()) {
     case "macos":
@@ -136,6 +246,24 @@ function osBadgeClass(os: string): string {
 // Palette Step Item (drag source)
 // ---------------------------------------------------------------------------
 
+/**
+ * One entry in the left-hand step palette.
+ *
+ * What the user sees: a card with the step name, a two-line-clamped
+ * description, and a chip per supported OS. It can be clicked to append the
+ * step, or dragged onto the canvas.
+ *
+ * @param schema the step schema to display.
+ * @param onAdd invoked on click to append this step to the canvas.
+ *
+ * AI Note: this uses the NATIVE HTML5 drag API (`draggable` +
+ * `dataTransfer`), while canvas reordering uses @dnd-kit. Two separate drag
+ * systems coexist on this page: palette -> canvas is native (a "copy"
+ * operation carrying the step name), canvas -> canvas is dnd-kit (a "move" of
+ * an existing id). The `application/nexus-step` MIME type is the private
+ * contract between this component and `handleCanvasDrop`; changing it in one
+ * place silently breaks drag-to-add.
+ */
 function PaletteItem({
   schema,
   onAdd,
@@ -187,6 +315,27 @@ function PaletteItem({
 // Sortable Canvas Card
 // ---------------------------------------------------------------------------
 
+/**
+ * A step card on the canvas: selectable, reorderable, removable.
+ *
+ * What the user sees: a drag handle, the 1-based position number, the step
+ * name, a short summary of the first few non-empty params, an optional "no
+ * node" chip, and an X to remove it. The selected card gets an indigo ring.
+ *
+ * @param bstep the builder step this card represents.
+ * @param index 0-based position; displayed as `index + 1`.
+ * @param schema the matching schema, or undefined if the server no longer
+ *   advertises this step (the card still renders, minus the "no node" chip).
+ * @param isSelected whether this card's params are in the right-hand editor.
+ * @param onSelect selects this card for editing.
+ * @param onRemove deletes it from the canvas.
+ *
+ * AI Note: dnd-kit's `listeners`/`attributes` are spread onto the grip button
+ * ONLY, not the card root. That is what allows the whole card to stay
+ * clickable for selection — putting them on the root would make every click
+ * start a drag. The `touch-none` class on the handle stops mobile scroll from
+ * hijacking the gesture.
+ */
 function SortableStepCard({
   bstep,
   index,
@@ -217,6 +366,11 @@ function SortableStepCard({
   };
 
   // Brief param summary
+  //
+  // AI Note: the filter drops `false` as well as empty values, so an
+  // explicitly-disabled boolean flag never appears in the summary line — it
+  // reads as "unset". Values are truncated at 30 chars and only the first 3
+  // params are shown; this is a preview, never a source of truth.
   const paramSummary = Object.entries(bstep.params)
     .filter(([, v]) => v !== "" && v !== false && v !== null && v !== undefined)
     .map(([k, v]) => {
@@ -270,6 +424,10 @@ function SortableStepCard({
             {paramSummary}
           </div>
         )}
+        {/* AI Note: `requires_node === false` means the step runs on the
+            server itself rather than being dispatched to an agent (e.g. flow
+            control). The chip is a scheduling hint for the user — such a step
+            will execute even if no node is available. */}
         {schema && !schema.requires_node && (
           <span className="inline-flex items-center mt-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-green-50 text-green-600">
             no node
@@ -297,6 +455,18 @@ function SortableStepCard({
 // Drag Overlay Card (follows cursor during drag)
 // ---------------------------------------------------------------------------
 
+/**
+ * The simplified card that follows the cursor while a canvas step is being
+ * dragged (rendered inside dnd-kit's `<DragOverlay>`).
+ *
+ * Intentionally a stripped-down copy of {@link SortableStepCard} — no params
+ * summary, no remove button, no sortable wiring — because the overlay is
+ * detached from the list and must not be interactive.
+ *
+ * @param bstep the step being dragged.
+ * @param index its position at drag start; the number does NOT update as the
+ *   item is dragged past others.
+ */
 function DragOverlayCard({
   bstep,
   index,
@@ -319,6 +489,17 @@ function DragOverlayCard({
 // Dynamic Param Editor
 // ---------------------------------------------------------------------------
 
+/**
+ * Renders the parameter form for the selected step, generated entirely from
+ * its schema's `fields` array.
+ *
+ * @param schema the selected step's schema; `fields` drives which inputs exist.
+ * @param params the current values (a controlled object owned by the page).
+ * @param onChange receives a NEW params object on every keystroke — the parent
+ *   replaces the whole object rather than mutating it.
+ *
+ * Renders an italic placeholder for steps that declare no fields.
+ */
 function ParamEditor({
   schema,
   params,
@@ -328,6 +509,7 @@ function ParamEditor({
   params: Record<string, unknown>;
   onChange: (params: Record<string, unknown>) => void;
 }) {
+  /** Immutably overwrite one field and bubble the whole params object up. */
   function updateField(name: string, value: unknown) {
     onChange({ ...params, [name]: value });
   }
@@ -354,6 +536,29 @@ function ParamEditor({
   );
 }
 
+/**
+ * Renders a single schema field as the appropriate input control.
+ *
+ * Dispatch on `field.field_type`:
+ *   - `boolean`                      -> checkbox
+ *   - `integer` / `number` / `float` -> number input (coerced with `Number`)
+ *   - everything else                -> text input
+ *
+ * @param field the schema descriptor (name, type, required, description,
+ *   examples).
+ * @param value current value from the params object.
+ * @param onUpdate emits the new value; numbers are already coerced.
+ *
+ * AI Note: the fallback branch swallows any field type the server invents
+ * (enums, secrets, file paths, JSON blobs) and renders it as free text. That
+ * is intentional so a new backend step is never *unusable* from the UI, but it
+ * means the value arrives at the API as a string. Add an explicit branch here
+ * when a type needs real handling.
+ *
+ * AI Note: required-ness is communicated only by an asterisk in the label —
+ * there is no client-side enforcement. The server rejects missing required
+ * params at submit time and the error surfaces in the submit banner.
+ */
 function FieldInput({
   field,
   value,
@@ -394,6 +599,11 @@ function FieldInput({
         <label className="block text-sm font-medium text-foreground mb-1">
           {labelText}
         </label>
+        {/* AI Note: an empty numeric field is stored as "" (not 0 and not
+            null) so the user can clear it without the input jumping to 0;
+            `handleSubmit` then strips it entirely. Coercing "" through
+            `Number()` here would produce 0 and silently submit a value the
+            user never entered. */}
         <input
           type="number"
           value={value === "" || value === null || value === undefined ? "" : Number(value)}
@@ -444,6 +654,21 @@ function FieldInput({
 // JobBuilder Page
 // ---------------------------------------------------------------------------
 
+/**
+ * Job builder page.
+ *
+ * What the user sees: three columns.
+ *   - Left: searchable, category-grouped step palette.
+ *   - Centre: the ordered canvas. Empty state invites a drag; otherwise a
+ *     vertical list of reorderable {@link SortableStepCard}s.
+ *   - Right: the selected step's generated parameter form on top, and the job
+ *     submission form (name, pool/node target, priority, submit) pinned below.
+ *
+ * Side effects: three GETs on mount (steps, pools, nodes); one POST /api/jobs
+ * on submit, followed by navigation to the new job's detail page.
+ *
+ * Props: none — routed component.
+ */
 export default function JobBuilder() {
   const navigate = useNavigate();
 
@@ -453,6 +678,13 @@ export default function JobBuilder() {
   const nodesStore = useNodesStore();
 
   // Fetch on mount
+  //
+  // AI Note: these components subscribe to the WHOLE store object, so
+  // `stepsStore`/`poolsStore`/`nodesStore` get a new identity on every store
+  // update. Listing them as deps would refetch forever, which is exactly why
+  // the exhaustive-deps rule is disabled here rather than "fixed". If you
+  // refactor to selector-based subscriptions (`useStepsStore(s => s.fetch)`),
+  // the disable comment can go away.
   useEffect(() => {
     stepsStore.fetch();
     poolsStore.fetch();
@@ -460,7 +692,7 @@ export default function JobBuilder() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Palette search
+  // Palette search — matches step name OR description, case-insensitively.
   const [search, setSearch] = useState("");
   const filteredSteps = useMemo(() => {
     if (!search.trim()) return stepsStore.steps;
@@ -475,6 +707,10 @@ export default function JobBuilder() {
   const grouped = useMemo(() => groupSteps(filteredSteps), [filteredSteps]);
 
   // Schema lookup
+  //
+  // AI Note: name -> schema index built from the *unfiltered* step list, not
+  // `filteredSteps`. Canvas cards and drop handling must resolve schemas even
+  // for steps the current palette search has hidden.
   const schemaMap = useMemo(() => {
     const m = new Map<string, StepSchemaInfo>();
     for (const s of stepsStore.steps) m.set(s.name, s);
@@ -482,6 +718,9 @@ export default function JobBuilder() {
   }, [stepsStore.steps]);
 
   // Builder state
+  // `builderSteps` is the authoritative ordered pipeline; `selectedId` drives
+  // the right-hand editor; `activeId` is the step currently being dragged (used
+  // only to render the drag overlay).
   const [builderSteps, setBuilderSteps] = useState<BuilderStep[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [activeId, setActiveId] = useState<string | null>(null);
@@ -498,6 +737,8 @@ export default function JobBuilder() {
   const [submitError, setSubmitError] = useState<string | null>(null);
 
   // Current selected step
+  // `selectedSchema` may be undefined if the server stopped advertising this
+  // step type; the right-hand panel then falls back to its placeholder.
   const selectedStep = builderSteps.find((s) => s.id === selectedId);
   const selectedSchema = selectedStep
     ? schemaMap.get(selectedStep.step)
@@ -505,6 +746,8 @@ export default function JobBuilder() {
 
   // -- Handlers --
 
+  /** Appends a step (with schema defaults) to the end of the canvas and
+   * immediately selects it so the user lands in its parameter form. */
   const addStep = useCallback(
     (schema: StepSchemaInfo) => {
       const newStep: BuilderStep = {
@@ -518,6 +761,8 @@ export default function JobBuilder() {
     []
   );
 
+  /** Deletes a step from the canvas, clearing the selection if it was the one
+   * being edited (otherwise the right panel would reference a dead id). */
   const removeStep = useCallback(
     (id: string) => {
       setBuilderSteps((prev) => prev.filter((s) => s.id !== id));
@@ -526,6 +771,8 @@ export default function JobBuilder() {
     [selectedId]
   );
 
+  /** Replaces one step's params wholesale (the editor always hands back a full
+   * object). Identity-stable so `ParamEditor` does not thrash. */
   const updateStepParams = useCallback(
     (id: string, params: Record<string, unknown>) => {
       setBuilderSteps((prev) =>
@@ -536,6 +783,11 @@ export default function JobBuilder() {
   );
 
   // Drag-and-drop
+  //
+  // AI Note: the 5px `activationConstraint` is what makes a card both
+  // clickable and draggable — without it, dnd-kit claims the pointer on
+  // mousedown and the click-to-select handler never fires. Lowering it makes
+  // selection unreliable; raising it makes dragging feel sticky.
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
     useSensor(KeyboardSensor, {
@@ -543,10 +795,22 @@ export default function JobBuilder() {
     })
   );
 
+  /** dnd-kit: records which card is being dragged so the overlay can render. */
   function handleDragStart(event: DragStartEvent) {
     setActiveId(String(event.active.id));
   }
 
+  /**
+   * dnd-kit: commits a reorder.
+   *
+   * AI Note: step ORDER is the pipeline's execution order and later steps can
+   * consume earlier steps' outputs — reordering can therefore break a job that
+   * was previously valid. The server re-validates the output-key chain at
+   * submit time; nothing here warns the user.
+   *
+   * The `oldIndex/newIndex === -1` guard covers a card removed mid-drag; it
+   * returns the previous state untouched rather than corrupting the list.
+   */
   function handleDragEnd(event: DragEndEvent) {
     setActiveId(null);
     const { active, over } = event;
@@ -561,6 +825,15 @@ export default function JobBuilder() {
   }
 
   // Canvas drop zone (for items dragged from palette via native drag)
+  /**
+   * Native-drag drop target for palette items (see the note on
+   * {@link PaletteItem}).
+   *
+   * AI Note: the dropped step is always APPENDED to the end — the drop
+   * position within the canvas is ignored. Users expecting "drop between two
+   * cards to insert there" will be surprised; reordering afterwards is the
+   * intended workflow.
+   */
   function handleCanvasDrop(e: React.DragEvent) {
     e.preventDefault();
     const stepName = e.dataTransfer.getData("application/nexus-step");
@@ -569,6 +842,9 @@ export default function JobBuilder() {
     if (schema) addStep(schema);
   }
 
+  /** Accepts the drag only when it carries our private MIME type, so dragging
+   * arbitrary files or text over the canvas does nothing. `preventDefault` is
+   * required for a drop event to fire at all. */
   function handleCanvasDragOver(e: React.DragEvent) {
     if (e.dataTransfer.types.includes("application/nexus-step")) {
       e.preventDefault();
@@ -577,6 +853,30 @@ export default function JobBuilder() {
   }
 
   // Submit job
+  /**
+   * Validates locally, serialises the canvas into the API payload, POSTs
+   * /api/jobs and navigates to the created job.
+   *
+   * Payload shape: `{ name, steps: [{ step, params }], target_pool_id?,
+   * target_node_id?, priority }`.
+   *
+   * AI Note: params are filtered before sending — `""`, null and undefined are
+   * dropped so the server sees "field absent" (and applies its own default)
+   * rather than "field set to empty". `false` is deliberately NOT filtered
+   * here (unlike the card's display summary), because an explicitly-off
+   * boolean is a meaningful value.
+   *
+   * AI Note: the two target fields are mutually exclusive by construction —
+   * only the one matching `targetMode` is populated, and an unselected
+   * dropdown sends `undefined` (no target at all, letting the scheduler pick).
+   * Sending both would be ambiguous to the scheduler.
+   *
+   * AI Note: this is where server-side chain validation errors surface. The
+   * server accumulates each step's OUTPUT_KEYS while walking the list, so a
+   * step referencing an output that no earlier step produces is rejected here
+   * with a descriptive message — that message goes straight into
+   * `submitError`.
+   */
   async function handleSubmit() {
     setSubmitError(null);
     if (!jobName.trim()) {
@@ -848,6 +1148,11 @@ export default function JobBuilder() {
               >
                 <option value="">-- Select Node --</option>
                 {nodesStore.nodes
+                  // AI Note: only `online` nodes are offered — `busy` nodes
+                  // are excluded even though they are perfectly valid targets
+                  // (the job would simply queue behind the current one). This
+                  // is stricter than the scheduler and can make a healthy
+                  // cluster look like it has no available targets.
                   .filter((n) => n.status === "online")
                   .map((n) => (
                     <option key={n.id} value={n.id}>

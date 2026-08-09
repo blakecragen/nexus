@@ -1,3 +1,35 @@
+/**
+ * Admin.tsx — the administrative console (route `/admin`).
+ *
+ * Role in the system:
+ *   A three-tab page covering the identity and secrets side of Nexus:
+ *     - Users:       create accounts, change roles, activate/deactivate.
+ *     - Groups:      create groups, manage membership and pool access grants.
+ *     - Credentials: store/test/delete the encrypted secrets that storage
+ *                    backends and job steps use.
+ *
+ * Data flow:
+ *   - Credentials go through `useCredentialsStore` and the typed `api` client
+ *     (GET/POST/DELETE /api/credentials, POST /api/credentials/{id}/test,
+ *     GET /api/credentials/types).
+ *   - Users and Groups use RAW `fetch()` against /api/admin/* — those endpoints
+ *     have no wrappers in `frontend/src/api/client.ts`.
+ *
+ * AI Note: that raw-fetch split matters. `api.request()` centralises the Bearer
+ * header, the 401 -> clear-token -> redirect-to-login behaviour, and error
+ * extraction from `detail`. None of that applies to the /api/admin/* calls
+ * here: they hand-roll the Authorization header from localStorage and mostly
+ * swallow failures, so an expired session on the Users/Groups tabs silently
+ * renders an empty table instead of bouncing the user to /login.
+ *
+ * AI Note: nothing on this page checks the caller's role client-side — it is
+ * routed like any other page. Authorisation is enforced entirely by the server
+ * on the /api/admin/* endpoints.
+ *
+ * Neighbours: credentials created here are selected on `Storage.tsx` when
+ * registering a backend; pool names granted to groups correspond to pools
+ * managed on `Pools.tsx`.
+ */
 import { useEffect, useState, useCallback } from "react";
 import {
   Plus,
@@ -18,16 +50,21 @@ import { api } from "@/api/client";
 import { cn, formatRelativeTime } from "@/lib/utils";
 import type { UserInfo, UserRole, CredentialTypeInfo } from "@/types";
 
+/** Which admin sub-view is showing; see {@link TAB_CONFIG}. */
 type AdminTab = "users" | "groups" | "credentials";
 
 // ── Role badge colors ─────────────────────────────────────────────────
 
+/** Pill styling per role, escalating red -> purple -> blue by privilege. Keys
+ * mirror the server's `UserRole` enum. */
 const ROLE_COLORS: Record<UserRole, string> = {
   admin: "bg-red-100 text-red-700",
   manager: "bg-purple-100 text-purple-700",
   user: "bg-blue-100 text-blue-700",
 };
 
+/** Renders the role pill for a user row. Unknown roles fall back to neutral
+ * styling rather than rendering unstyled. */
 function roleBadge(role: UserRole) {
   return (
     <span
@@ -42,12 +79,20 @@ function roleBadge(role: UserRole) {
 }
 
 // ── Group types (local) ───────────────────────────────────────────────
+//
+// AI Note: these shapes are declared here rather than in `@/types` because the
+// /api/admin/groups endpoints have no client wrapper and no shared type. They
+// are hand-written mirrors of the server response — if the API changes, nothing
+// will fail to compile; it will just render wrong at runtime.
 
+/** One member row inside a {@link GroupInfo}. */
 interface GroupMember {
   user_id: string;
   username: string;
 }
 
+/** A group as returned by GET /api/admin/groups. `pool_access` is a list of
+ * pool identifiers (names or ids) the group is allowed to target. */
 interface GroupInfo {
   id: string;
   name: string;
@@ -58,6 +103,25 @@ interface GroupInfo {
 
 // ── Users Tab ─────────────────────────────────────────────────────────
 
+/**
+ * "Users" tab — the account list plus inline role editing, an active toggle and
+ * a create-user dialog.
+ *
+ * What the user sees: a four-column table (Username, Email, Role, Active).
+ * Clicking the role pill turns it into a `<select>`; the Active cell is a
+ * switch that flips immediately.
+ *
+ * Endpoints:
+ *   - GET  /api/admin/users              (raw fetch)
+ *   - PUT  /api/admin/users/{id}/role    (raw fetch)
+ *   - PUT  /api/admin/users/{id}/active  (raw fetch)
+ *   - POST /api/auth/register            (via `api.register`, the one typed call)
+ *
+ * AI Note: creating a user reuses the public registration endpoint with an
+ * explicit `role`. The server must therefore be the thing that prevents a
+ * non-admin from self-registering as `admin` — this form happily sends any role
+ * the dropdown offers.
+ */
 function UsersTab() {
   const [users, setUsers] = useState<UserInfo[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -70,6 +134,19 @@ function UsersTab() {
   const [formError, setFormError] = useState<string | null>(null);
   const [editingRoleId, setEditingRoleId] = useState<string | null>(null);
 
+  /**
+   * Loads the user list.
+   *
+   * AI Note: reads the token straight out of localStorage (`nexus_token`)
+   * instead of `getToken()` from the api client. Both read the same key today,
+   * but this bypass means the in-memory token set by `setToken()` is ignored —
+   * if token storage ever moves off localStorage, every raw fetch on this page
+   * breaks at once.
+   *
+   * AI Note: a non-OK response is not distinguished from a network error — both
+   * leave `users` at its previous value and stop the spinner, so a 403 looks
+   * identical to "no users".
+   */
   const fetchUsers = useCallback(async () => {
     setIsLoading(true);
     try {
@@ -93,6 +170,12 @@ function UsersTab() {
     fetchUsers();
   }, [fetchUsers]);
 
+  /**
+   * Creates a user via POST /api/auth/register, refetches the table and resets
+   * the dialog. Unlike the other handlers here this one *does* surface the
+   * error (duplicate username, weak password) in a red banner, because those
+   * are recoverable input problems the operator must see.
+   */
   const handleCreate = useCallback(
     async (e: React.FormEvent) => {
       e.preventDefault();
@@ -120,6 +203,15 @@ function UsersTab() {
     [formUsername, formPassword, formEmail, formRole, fetchUsers]
   );
 
+  /**
+   * Changes a user's role (PUT /api/admin/users/{id}/role).
+   *
+   * AI Note: security-sensitive and OPTIMISTIC — the local `users` array is
+   * patched without checking `res.ok`. If the server rejects the change (e.g.
+   * an admin trying to demote the last admin, or a stale session), the table
+   * will display the new role while the backend still holds the old one until
+   * the next refetch. Do not treat what this table shows as authoritative.
+   */
   const handleRoleChange = useCallback(
     async (userId: string, newRole: UserRole) => {
       try {
@@ -142,6 +234,17 @@ function UsersTab() {
     []
   );
 
+  /**
+   * Enables/disables a user account (PUT /api/admin/users/{id}/active).
+   *
+   * @param isActive the user's CURRENT state — the handler sends `!isActive`.
+   *   Passing the desired state instead would invert the toggle.
+   *
+   * AI Note: same optimistic-update caveat as {@link handleRoleChange}: the
+   * response is never inspected, so a rejected deactivation still flips the
+   * switch on screen. Deactivating an account is a security control (it should
+   * stop that user from logging in), so a silent failure here is worth fixing.
+   */
   const handleToggleActive = useCallback(
     async (userId: string, isActive: boolean) => {
       try {
@@ -221,6 +324,12 @@ function UsersTab() {
                   </td>
                   <td className="px-4 py-3">
                     {editingRoleId === u.id ? (
+                      // AI Note: `defaultValue` (uncontrolled) plus `onBlur` to
+                      // exit edit mode. `handleRoleChange` also clears
+                      // `editingRoleId`, so selecting an option fires change ->
+                      // save -> collapse; blurring without choosing just
+                      // collapses. Switching this to a controlled `value` would
+                      // require tracking a draft role in state.
                       <select
                         defaultValue={u.role}
                         onChange={(e) =>
@@ -366,6 +475,28 @@ function UsersTab() {
 
 // ── Groups Tab ────────────────────────────────────────────────────────
 
+/**
+ * "Groups" tab — accordion of groups, each expanding to show member chips and
+ * pool-access chips with inline add/remove controls.
+ *
+ * What the user sees: one collapsible card per group showing its name, member
+ * count and description. Expanding reveals two sections ("Members", "Pool
+ * Access"), each with a "+ Add" link that toggles an inline text input
+ * (Enter or the Add button submits).
+ *
+ * Endpoints (all raw fetch, no client wrapper):
+ *   - GET    /api/admin/groups
+ *   - POST   /api/admin/groups
+ *   - POST   /api/admin/groups/{id}/members         `{ username }`
+ *   - DELETE /api/admin/groups/{id}/members/{userId}
+ *   - POST   /api/admin/groups/{id}/pools           `{ pool_name }`
+ *
+ * AI Note: adding a member takes a free-text USERNAME (not an id) and adding
+ * pool access takes a free-text pool name/id — there is no picker and no
+ * validation, so a typo produces a silent no-op (all these handlers swallow
+ * errors and just refetch). There is also no way to REVOKE pool access from
+ * this UI; the chips are display-only.
+ */
 function GroupsTab() {
   const [groups, setGroups] = useState<GroupInfo[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -382,11 +513,19 @@ function GroupsTab() {
   const [addPoolGroupId, setAddPoolGroupId] = useState<string | null>(null);
   const [addPoolName, setAddPoolName] = useState("");
 
+  // AI Note: built once per render from localStorage, then captured by the
+  // `useCallback` handlers below — which deliberately do NOT list it as a
+  // dependency (it is a fresh object every render and would defeat the
+  // memoisation). The captured value is the token as of the render in which
+  // the callback was created; that is fine because the token only changes on
+  // login/logout, both of which remount this page.
   const authHeader = {
     Authorization: `Bearer ${localStorage.getItem("nexus_token")}`,
     "Content-Type": "application/json",
   };
 
+  /** Loads all groups with their members and pool grants. Same silent-failure
+   * behaviour as the Users tab: a 403 renders as "no groups". */
   const fetchGroups = useCallback(async () => {
     setIsLoading(true);
     try {
@@ -403,6 +542,13 @@ function GroupsTab() {
     fetchGroups();
   }, [fetchGroups]);
 
+  /**
+   * Creates a group (POST /api/admin/groups), refetches and resets the dialog.
+   *
+   * This is the only raw-fetch handler on the page that checks `res.ok` and
+   * pulls `detail` out of the error body — the rest fire and forget. An empty
+   * description is sent as explicit `null` rather than omitted.
+   */
   const handleCreate = useCallback(
     async (e: React.FormEvent) => {
       e.preventDefault();
@@ -434,6 +580,9 @@ function GroupsTab() {
     [formName, formDescription, fetchGroups]
   );
 
+  /** Revokes a user's membership, then refetches the whole group list (rather
+   * than patching locally) so member counts stay consistent. No confirmation
+   * prompt — re-adding is a one-field operation. */
   const handleRemoveMember = useCallback(
     async (groupId: string, userId: string) => {
       try {
@@ -449,6 +598,14 @@ function GroupsTab() {
     [fetchGroups]
   );
 
+  /**
+   * Adds a member by username, then closes the inline input.
+   *
+   * AI Note: the input is cleared and closed unconditionally on success *of the
+   * fetch call*, not of the request — a 404 for an unknown username looks
+   * exactly like a successful add until the refetched list shows the member is
+   * absent. This is the single most confusing behaviour on this tab.
+   */
   const handleAddMember = useCallback(
     async (groupId: string) => {
       if (!addMemberUsername.trim()) return;
@@ -468,6 +625,14 @@ function GroupsTab() {
     [addMemberUsername, fetchGroups]
   );
 
+  /**
+   * Grants the group access to a pool (POST .../pools with `{ pool_name }`).
+   *
+   * AI Note: security-sensitive — this widens which pools a group's members can
+   * target when submitting jobs. Same silent-failure behaviour as
+   * {@link handleAddMember}: a bad pool name closes the input as if it worked.
+   * The displayed chips come from the refetch, so they are the source of truth.
+   */
   const handleAddPool = useCallback(
     async (groupId: string) => {
       if (!addPoolName.trim()) return;
@@ -743,6 +908,26 @@ function GroupsTab() {
 
 // ── Credentials Tab ───────────────────────────────────────────────────
 
+/**
+ * "Credentials" tab — the encrypted secret store.
+ *
+ * What the user sees: a table of stored credentials (name, type pill,
+ * description, shared flag, created time) with per-row Test and Delete
+ * actions, plus a "Create Credential" dialog whose fields are generated from
+ * the selected credential type's schema.
+ *
+ * Endpoints (all through the typed `api` client, unlike the other two tabs):
+ *   - GET    /api/credentials
+ *   - GET    /api/credentials/types      -> drives the dynamic form
+ *   - POST   /api/credentials
+ *   - POST   /api/credentials/{id}/test
+ *   - DELETE /api/credentials/{id}
+ *
+ * AI Note: secret VALUES are write-only. The list endpoint returns metadata
+ * only — the encrypted `data` blob is never sent to the browser, which is why
+ * there is no edit action here (only create, test, delete). Do not add an
+ * "edit" flow that pre-fills existing secret values; they are not available.
+ */
 function CredentialsTab() {
   const { credentials, isLoading, fetch } = useCredentialsStore();
   const [credTypes, setCredTypes] = useState<CredentialTypeInfo[]>([]);
@@ -760,13 +945,27 @@ function CredentialsTab() {
   const [formSubmitting, setFormSubmitting] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
 
+  // Loads the credential list and the type catalogue. A failed type fetch is
+  // swallowed, which leaves the Type dropdown empty and the Create button
+  // permanently disabled (it requires `formType`).
   useEffect(() => {
     fetch();
     api.listCredentialTypes().then(setCredTypes).catch(() => {});
   }, [fetch]);
 
+  // The schema for the type currently chosen in the dialog; drives which
+  // required/optional inputs are rendered. Undefined until a type is picked.
   const selectedType = credTypes.find((t) => t.credential_type === formType);
 
+  /**
+   * Verifies a stored credential against its target service
+   * (POST /api/credentials/{id}/test) and shows a tick or cross in the row.
+   *
+   * AI Note: as on the Storage page, a thrown request is recorded as
+   * `false` — "could not run the test" is displayed identically to "the
+   * credential is invalid". Results are keyed by id and never cleared, so a
+   * tick can go stale after the underlying secret is rotated elsewhere.
+   */
   const handleTest = useCallback(async (id: string) => {
     setTestingId(id);
     try {
@@ -779,6 +978,14 @@ function CredentialsTab() {
     }
   }, []);
 
+  /**
+   * Deletes a credential after a native `confirm()`.
+   *
+   * AI Note: nothing here checks whether the credential is still referenced by
+   * a storage backend (`Storage.tsx` binds backends to `credential_id`) or by a
+   * job step. If the server allows the delete, those consumers break at their
+   * next use. Verify referential behaviour server-side before relying on this.
+   */
   const handleDelete = useCallback(
     async (id: string) => {
       if (!confirm("Delete this credential? This cannot be undone.")) return;
@@ -795,6 +1002,19 @@ function CredentialsTab() {
     [fetch]
   );
 
+  /**
+   * Creates a credential (POST /api/credentials) and resets the dialog.
+   *
+   * `formData` is the free-form `{ fieldName: value }` map assembled from the
+   * selected type's required/optional fields; the server encrypts it at rest
+   * and it is never returned by the list endpoint.
+   *
+   * AI Note: `is_shared` makes the credential visible to ALL users, not just
+   * its creator — a deliberate privilege decision surfaced as a single
+   * checkbox. The form is only cleared on success, so a validation failure
+   * preserves whatever secrets were typed (they stay in component state, never
+   * in storage).
+   */
   const handleCreate = useCallback(
     async (e: React.FormEvent) => {
       e.preventDefault();
@@ -984,6 +1204,10 @@ function CredentialsTab() {
                   required
                   value={formType}
                   onChange={(e) => {
+                    // AI Note: switching type WIPES `formData`. Field names are
+                    // type-specific, so carrying values over would submit
+                    // fields the new type does not declare — and could leak a
+                    // secret typed for one service into a request to another.
                     setFormType(e.target.value);
                     setFormData({});
                   }}
@@ -1011,7 +1235,13 @@ function CredentialsTab() {
                 />
               </div>
 
-              {/* Dynamic fields based on selected type */}
+              {/* Dynamic fields based on selected type.
+                  AI Note: input masking is decided by NAME SUBSTRING —
+                  anything containing "password", "secret" or "key" renders as
+                  type="password". This is a heuristic, not a guarantee: a
+                  sensitive field named e.g. "token" or "passphrase" will be
+                  displayed in plain text. Extend the substring list rather
+                  than assuming the server marks fields as secret. */}
               {selectedType && (
                 <div className="space-y-3 rounded-lg border border-border p-4">
                   <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
@@ -1110,12 +1340,27 @@ function CredentialsTab() {
 
 // ── Admin Page (root) ─────────────────────────────────────────────────
 
+/** Tab strip definition for {@link Admin}; order here is render order. */
 const TAB_CONFIG: Array<{ key: AdminTab; label: string; icon: React.ElementType }> = [
   { key: "users", label: "Users", icon: Users },
   { key: "groups", label: "Groups", icon: Shield },
   { key: "credentials", label: "Credentials", icon: Key },
 ];
 
+/**
+ * Admin console shell (route `/admin`).
+ *
+ * What the user sees: an "Admin" heading, an icon tab strip, and the active
+ * tab's content below it. Defaults to Users.
+ *
+ * AI Note: tab bodies are conditionally MOUNTED, not hidden — switching tabs
+ * unmounts the previous one, discarding its local state and re-running its
+ * fetch effect on return. That is why each tab owns its own loading state and
+ * refetches from scratch; there is no shared cache between them (except
+ * credentials, which live in a Zustand store).
+ *
+ * Props: none — routed component. Holds no data of its own.
+ */
 export default function Admin() {
   const [activeTab, setActiveTab] = useState<AdminTab>("users");
 

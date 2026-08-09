@@ -1,7 +1,50 @@
+/**
+ * Login.tsx — unauthenticated entry point for the Nexus dashboard.
+ *
+ * Role in the system:
+ *   Rendered by `App.tsx` at the `/login` route. This is the ONLY route that
+ *   sits outside the `<Layout />` shell, so it renders no sidebar/header and
+ *   assumes no session exists yet.
+ *
+ * Responsibilities:
+ *   - Collect username/password and hand them to `useAuthStore.login()`
+ *     (`frontend/src/stores/index.ts`), which POSTs `/api/auth/login`, stashes
+ *     the access token via `setToken()` (localStorage key `nexus_token`), saves
+ *     the refresh token under `nexus_refresh`, then GETs `/api/auth/me` to
+ *     populate `user`.
+ *   - Surface server-side auth errors inline instead of throwing.
+ *   - Redirect to `/` on success so `<Layout />` can take over.
+ *
+ * Neighbours:
+ *   - Callers: `App.tsx` route table.
+ *   - Calls: `useAuthStore` (Zustand) -> `api.login` / `api.getMe`
+ *     (`frontend/src/api/client.ts`).
+ *   - Counterpart: `client.ts` `request()` force-navigates back here on any
+ *     401, so this page is also the implicit "session expired" landing spot.
+ */
 import { useState, type FormEvent } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuthStore } from "@/stores";
 
+/**
+ * Full-screen centred sign-in card.
+ *
+ * What the user sees: the "NEXUS" wordmark, an optional red error banner, and
+ * a two-field form (username, password) with a submit button whose label
+ * flips to "Signing in..." while the request is in flight.
+ *
+ * State:
+ *   - `username` / `password`: controlled inputs (never persisted anywhere but
+ *     component state; only the resulting tokens are stored).
+ *   - `error`: last failure message from the auth store, cleared on re-submit.
+ *   - `isSubmitting`: disables the button to prevent duplicate login POSTs.
+ *
+ * Side effects: writes `nexus_token` + `nexus_refresh` to localStorage (via the
+ * store) and navigates to `/` with `replace: true` so the browser Back button
+ * does not return the user to the login form after a successful sign-in.
+ *
+ * Props: none — this is a routed page component.
+ */
 export default function LoginPage() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -10,6 +53,22 @@ export default function LoginPage() {
   const login = useAuthStore((s) => s.login);
   const navigate = useNavigate();
 
+  /**
+   * Submit handler for the credentials form.
+   *
+   * Flow: prevent the native form navigation -> clear any previous error ->
+   * `useAuthStore.login()` (network) -> navigate to the dashboard.
+   *
+   * Errors from `login()` (bad credentials, server down, network failure) are
+   * caught and rendered in the banner rather than bubbling to an error
+   * boundary, so a typo never blanks the page.
+   *
+   * AI Note: `isSubmitting` is reset in `finally`, including on the success
+   * path where we have already called `navigate()`. React may still be mounted
+   * for a tick during the route transition, so this must stay in `finally` —
+   * moving it into the `catch` would leave the button permanently disabled if
+   * navigation is ever cancelled or the route re-renders this page.
+   */
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
     setError(null);

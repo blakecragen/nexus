@@ -1,3 +1,32 @@
+/**
+ * JobDetail.tsx — single-job inspection view (route `/jobs/:id`).
+ *
+ * Role in the system:
+ *   The deepest read view in the app. It combines four different data sources
+ *   into one screen: the job + its step runs, the live log stream, the
+ *   persisted terminal log, and the result tarball's contents.
+ *
+ * Data flow:
+ *   - GET /api/jobs/{id}                    -> job, steps, context_data,
+ *                                              has_results (polled while active)
+ *   - GET /api/artifacts?job_id={id}        -> the artifacts table at the bottom
+ *   - GET /api/jobs/{id}/log                -> plain-text "Full Terminal Log" tab
+ *   - GET /api/jobs/{id}/results/manifest   -> the Results file tree
+ *   - GET /api/jobs/{id}/results/download   -> authenticated tarball download
+ *   - POST /api/jobs/{id}/cancel            -> Cancel Job button
+ *   - `useLiveLogsStore` supplies the per-step live log lines, which are
+ *     pushed in by `handleWsMessage` from the `/ws/dashboard` socket that
+ *     `<Layout />` owns (message type `step.log`).
+ *
+ * AI Note: this page uses BOTH polling and WebSockets, and they cover
+ * different things. Step status/timing comes from the 3s poll; log *lines*
+ * only ever arrive over the socket. If the socket is down, the timeline still
+ * advances but the Logs tab stays empty — that asymmetry explains most
+ * "the logs are blank but the job is running" reports.
+ *
+ * File layout: badge/format helpers -> results-tree machinery (buildTree,
+ * fileGlyph, TreeRow, ResultsTree) -> the exported page component.
+ */
 import { useEffect, useState, useRef, useCallback } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import {
@@ -23,8 +52,18 @@ import { useLiveLogsStore } from "@/stores";
 import { cn, formatBytes, formatRelativeTime } from "@/lib/utils";
 import type { JobDetail as JobDetailType, StepRunInfo, StepStatus, JobStatus, ArtifactInfo } from "@/types";
 
+/** Keys for the right-hand detail panel's tab strip. `"results"` is only ever
+ * present when the job reported `has_results`, so `activeTab` can hold a value
+ * that has no visible tab if the flag flips off mid-session. */
 type DetailTab = "logs" | "params" | "outputs" | "context" | "full-log" | "results";
 
+/**
+ * Job-level status pill shown next to the job title.
+ *
+ * Third copy of the status colour map (see also `Jobs.tsx` and
+ * `Dashboard.tsx`); keep them consistent when the backend `JobStatus` enum
+ * changes. Unknown statuses fall back to neutral styling.
+ */
 function statusBadge(status: JobStatus) {
   const colors: Record<JobStatus, string> = {
     running: "bg-blue-100 text-blue-700",
@@ -46,6 +85,18 @@ function statusBadge(status: JobStatus) {
   );
 }
 
+/**
+ * Per-step icon for the timeline.
+ *
+ * @param status the `StepStatus` from a `StepRunInfo`.
+ *
+ * AI Note: `StepStatus` is a *different* enum from `JobStatus` — a step is
+ * `success`/`failed`/`running`/`cancelled`/`skipped`/`pending`, note "success"
+ * rather than "completed". Do not reuse the job status maps here.
+ *
+ * AI Note: `pending` and the `default` branch share the clock icon, so any
+ * unrecognised status renders as "not started yet" rather than blowing up.
+ */
 function stepStatusIcon(status: StepStatus) {
   switch (status) {
     case "success":
@@ -64,6 +115,18 @@ function stepStatusIcon(status: StepStatus) {
   }
 }
 
+/**
+ * Elapsed-time formatter for a single step run.
+ *
+ * @param start `started_at` ISO string, or null if the step never ran.
+ * @param end `finished_at` ISO string, or null while it is still running.
+ * @returns `"-"`, `"12s"`, `"3m 4s"` or `"1h 20m"`.
+ *
+ * AI Note: byte-for-byte the same logic as `formatDuration` in `Jobs.tsx` —
+ * duplicated rather than shared. Same caveats apply: a running step's duration
+ * is computed at render time (it only advances when the 3s poll re-renders the
+ * page) and `Math.max(0, ...)` clamps clock skew between server and browser.
+ */
 function formatDuration(start: string | null, end: string | null): string {
   if (!start) return "-";
   const from = new Date(start).getTime();
@@ -78,6 +141,17 @@ function formatDuration(start: string | null, end: string | null): string {
   return `${hrs}h ${remMins}m`;
 }
 
+/**
+ * Pretty-printed, scrollable JSON viewer used by the Params, Outputs and
+ * Context tabs.
+ *
+ * @param data any JSON-serialisable value. `undefined` renders as an empty
+ *   block, which is why callers pass a `{ note: ... }` placeholder instead.
+ *
+ * AI Note: `JSON.stringify` throws on circular structures. Everything shown
+ * here comes from the API as parsed JSON, so that cannot happen today — but do
+ * not repurpose this component for arbitrary client-side objects.
+ */
 function JsonBlock({ data }: { data: unknown }) {
   return (
     <pre className="overflow-auto rounded-lg bg-gray-900 p-4 text-xs text-muted-foreground font-mono leading-relaxed max-h-[500px]">
@@ -87,8 +161,16 @@ function JsonBlock({ data }: { data: unknown }) {
 }
 
 // ── Results file tree ──────────────────────────────────────────────────────
+//
+// The server returns the results tarball's table of contents as a FLAT list of
+// entries (`GET /api/jobs/{id}/results/manifest`). Everything below turns that
+// flat list into an expandable directory tree without ever downloading the
+// archive itself.
 
+/** One row of the flat tarball manifest as returned by the server. `path` is
+ * archive-relative and may or may not have a trailing slash for directories. */
 type ManifestEntry = { path: string; size: number; is_dir: boolean };
+/** A node in the tree built by {@link buildTree}. */
 type TreeNode = {
   name: string;
   path: string;
@@ -97,11 +179,27 @@ type TreeNode = {
   children: TreeNode[];
 };
 
-/** Build a nested tree from the flat tarball manifest. */
+/**
+ * Build a nested tree from the flat tarball manifest.
+ *
+ * @param entries the manifest rows, in whatever order the archive listed them.
+ * @returns a synthetic root node (`name`/`path` are `""`); callers render
+ *   `root.children`, never the root itself.
+ *
+ * AI Note: entry order is NOT assumed. `ensureDir` recursively materialises
+ * missing ancestors, so a file can appear before (or entirely without) its
+ * parent directory entry — which real tarballs frequently do.
+ *
+ * AI Note: `dirOf` is what keeps this O(n) and prevents duplicate directory
+ * nodes; it is seeded with `"" -> root` so the recursion terminates at the top
+ * level.
+ */
 function buildTree(entries: ManifestEntry[]): TreeNode {
   const root: TreeNode = { name: "", path: "", isDir: true, size: 0, children: [] };
   const dirOf = new Map<string, TreeNode>([["", root]]);
 
+  /** Return the node for `path`, creating it (and every missing ancestor) on
+   * demand. Memoised through `dirOf` so each directory exists exactly once. */
   const ensureDir = (path: string): TreeNode => {
     if (dirOf.has(path)) return dirOf.get(path)!;
     const slash = path.lastIndexOf("/");
@@ -119,6 +217,10 @@ function buildTree(entries: ManifestEntry[]): TreeNode {
   };
 
   for (const e of entries) {
+    // AI Note: tar directory entries conventionally end in "/" ("m5out/"),
+    // file entries do not. Stripping trailing slashes is what makes "m5out/"
+    // and "m5out" resolve to the same node instead of creating a phantom
+    // empty-named child. An entry that is nothing but slashes is skipped.
     const clean = e.path.replace(/\/+$/, "");
     if (!clean) continue;
     if (e.is_dir) {
@@ -137,6 +239,12 @@ function buildTree(entries: ManifestEntry[]): TreeNode {
   }
 
   // Aggregate dir sizes + sort (dirs first, then alpha).
+  //
+  // AI Note: `finalize` MUTATES each directory node's `size` in place, turning
+  // it from 0 into the recursive sum of its descendants, and returns that sum
+  // so the parent can accumulate. It must run exactly once per tree; calling
+  // it twice is harmless only because directory sizes are recomputed from
+  // scratch, but file sizes are returned untouched.
   const finalize = (node: TreeNode): number => {
     if (!node.isDir) return node.size;
     let total = 0;
@@ -151,6 +259,16 @@ function buildTree(entries: ManifestEntry[]): TreeNode {
   return root;
 }
 
+/**
+ * Picks an icon + tint for a file row based on its name.
+ *
+ * @param name the bare filename (no directory part).
+ *
+ * AI Note: `stats.txt` is special-cased because it is gem5's primary output
+ * file — the one users open first. It gets an emerald chart icon here and a
+ * highlighted row + "stats" chip in {@link TreeRow}. The `.txt` branch below
+ * would otherwise swallow it, so this check must stay first.
+ */
 function fileGlyph(name: string) {
   const lower = name.toLowerCase();
   if (lower === "stats.txt") return { Icon: FileBarChart, className: "text-emerald-400" };
@@ -161,8 +279,33 @@ function fileGlyph(name: string) {
   return { Icon: FileIcon, className: "text-zinc-500" };
 }
 
+/**
+ * One row of the results tree — recursive: directories render their children
+ * through nested `TreeRow`s.
+ *
+ * What the user sees: directories are clickable disclosure rows showing a
+ * chevron, folder glyph, child count and aggregate size; files are static rows
+ * with a type icon and size. `stats.txt` gets a highlighted background and a
+ * "stats" chip.
+ *
+ * @param node the tree node to render.
+ * @param depth 0 for top-level entries; drives the left padding and the indent
+ *   guide line.
+ *
+ * AI Note: `useState(depth < 1)` means only the first level is expanded on
+ * mount. Because expansion state lives in each row (not lifted), collapsing a
+ * parent and re-expanding it preserves the children's own open/closed state —
+ * they never unmount, they are just hidden by the conditional render... except
+ * they ARE unmounted (`{open && ...}`), so state does reset. Do not rely on it.
+ *
+ * AI Note: this component is purely a viewer — there is no per-file download.
+ * The whole archive is fetched via the Download button in {@link ResultsTree}.
+ */
 function TreeRow({ node, depth }: { node: TreeNode; depth: number }) {
   const [open, setOpen] = useState(depth < 1); // top-level dir expanded by default
+  // AI Note: 16px per depth level + 12px base gutter; the indent guide line in
+  // the expanded branch below uses `depth * 16 + 19` to sit under the chevron.
+  // Changing one without the other visibly misaligns the tree.
   const pad = { paddingLeft: `${depth * 16 + 12}px` };
   const isStats = !node.isDir && node.name.toLowerCase() === "stats.txt";
 
@@ -230,6 +373,25 @@ function TreeRow({ node, depth }: { node: TreeNode; depth: number }) {
   );
 }
 
+/**
+ * The "Results" tab body: an archive summary strip with a Download button,
+ * plus the expandable file tree.
+ *
+ * @param manifest the parsed manifest, or null while it is still loading — the
+ *   null case renders a "Reading archive…" spinner, so this component doubles
+ *   as its own loading state.
+ * @param downloading true while the tarball download is in flight; disables the
+ *   button and swaps in a spinner.
+ * @param onDownload triggers the authenticated blob download in the parent.
+ *
+ * AI Note: {@link buildTree} runs on every render (no `useMemo`). Manifests are
+ * small (tens to hundreds of entries) and the parent re-renders rarely, so this
+ * is fine — but it would need memoising if manifests ever got large.
+ *
+ * AI Note: `fileCount` counts only non-directory entries, while
+ * `archive_bytes` is the *compressed* size of the whole tarball. The per-file
+ * sizes in the tree are uncompressed, so they will not sum to `archive_bytes`.
+ */
 function ResultsTree({
   manifest,
   downloading,
@@ -295,6 +457,30 @@ function ResultsTree({
 }
 
 
+/**
+ * Job detail page.
+ *
+ * What the user sees:
+ *   - Header: back arrow, job name, status pill, submitter/created/started/
+ *     completed metadata, and a "Cancel Job" button while the job is active.
+ *   - An error banner if the job failed with a message.
+ *   - Left column: the step timeline. Each step shows its index, name, status
+ *     icon, duration and a truncated error. Clicking one selects it and jumps
+ *     back to the Logs tab.
+ *   - Right column: a tab strip over the selected step — Logs (live), Params,
+ *     Outputs, Context, Full Terminal Log, and Results (only when the job has
+ *     a results tarball).
+ *   - Bottom: the artifacts table, when any exist.
+ *
+ * Key state:
+ *   - `detail`: the whole GET /api/jobs/{id} payload; null until loaded, which
+ *     also drives the full-page spinner.
+ *   - `selectedStep`: index into `detail.steps`, and half of the live-log key.
+ *   - `activeTab`: which right-hand panel is shown; several effects key off it
+ *     so data is only fetched when its tab is opened.
+ *
+ * Props: none — routed component reading `:id` from the URL.
+ */
 export default function JobDetail() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -315,6 +501,10 @@ export default function JobDetail() {
   const logContainerRef = useRef<HTMLDivElement>(null);
 
   // Fetch job detail
+  //
+  // AI Note: a failed fetch deliberately leaves `detail` null, which renders
+  // the same spinner as "still loading" — a deleted or forbidden job id shows
+  // an indefinite spinner rather than a 404 state. Known rough edge.
   useEffect(() => {
     if (!id) return;
     setIsLoading(true);
@@ -322,6 +512,10 @@ export default function JobDetail() {
       .then((jobDetail) => {
         setDetail(jobDetail);
         // Select the running step by default if any
+        //
+        // AI Note: this only runs on the initial load (effect is keyed on
+        // `id`), not on every poll — otherwise the selection would jump out
+        // from under the user each time the job advanced a step.
         const runningIdx = jobDetail.steps.findIndex((s) => s.status === "running");
         if (runningIdx >= 0) setSelectedStep(runningIdx);
       })
@@ -334,6 +528,17 @@ export default function JobDetail() {
   }, [id]);
 
   // Poll for updates while job is active
+  //
+  // AI Note: 3000 ms is the refresh cadence for step status/timings. The
+  // dependency array is `[id, detail?.job.status]` — NOT `[id, detail]` — so
+  // the interval is only torn down and recreated when the *status* changes,
+  // not on every polled payload. Depending on `detail` would restart the timer
+  // every 3s and can drift into a tight loop; do not "fix" the exhaustive-deps
+  // warning by adding `detail` here.
+  //
+  // AI Note: the interval stops as soon as the job reaches a terminal state,
+  // so the final payload is whatever the last in-flight poll returned. The
+  // status transition itself is what re-runs this effect and clears the timer.
   useEffect(() => {
     if (!id || !detail) return;
     const isActive = ["pending", "queued", "running"].includes(detail.job.status);
@@ -353,9 +558,18 @@ export default function JobDetail() {
   }, [id, detail?.job.status]);
 
   // Auto-scroll logs
+  //
+  // AI Note: `logKey` must match the key format used by
+  // `useLiveLogsStore.appendLog` — `${jobId}:${stepIndex}` (see
+  // frontend/src/stores/index.ts). Change one and live logs silently stop
+  // appearing, because the lookup just misses.
   const logKey = id ? `${id}:${selectedStep}` : "";
   const currentLogs = logs[logKey] || [];
 
+  // AI Note: keyed on `currentLogs.length`, not the array identity — this
+  // pins the log pane to the bottom as lines stream in. It also means the view
+  // snaps back down even if the user has scrolled up to read history, which is
+  // a known annoyance during long-running steps.
   useEffect(() => {
     if (logContainerRef.current) {
       logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
@@ -364,6 +578,17 @@ export default function JobDetail() {
 
   // Fetch the persisted per-job terminal log when its tab is open (and refresh
   // while the job is still active).
+  //
+  // AI Note: this is the server-side `Job.log_text` (GET /api/jobs/{id}/log,
+  // plain text), a *different* source from the WebSocket-driven per-step live
+  // logs above. It survives page reloads and socket drops; the live logs do
+  // not. Both can legitimately show different content.
+  //
+  // AI Note: the `cancelled` flag is the classic stale-response guard — the
+  // 3s interval means a response can land after the tab has been switched or
+  // the component unmounted, and writing state then would either overwrite
+  // fresher data or warn. Both the immediate `load()` and the interval share
+  // the flag, and the cleanup clears the interval too.
   useEffect(() => {
     if (activeTab !== "full-log" || !id) return;
     let cancelled = false;
@@ -375,6 +600,11 @@ export default function JobDetail() {
   }, [activeTab, id, detail?.job.status]);
 
   // Fetch the results manifest (file list inside the tarball) when its tab opens.
+  //
+  // AI Note: fetched lazily and exactly once per (tab, id, has_results) — the
+  // manifest is not polled, because results only exist after the job has
+  // finished uploading its tarball. `has_results` is the gate: without it the
+  // endpoint would 404.
   useEffect(() => {
     if (activeTab !== "results" || !id || !detail?.has_results) return;
     let cancelled = false;
@@ -384,6 +614,15 @@ export default function JobDetail() {
     return () => { cancelled = true; };
   }, [activeTab, id, detail?.has_results]);
 
+  /**
+   * Downloads the whole results tarball.
+   *
+   * AI Note: delegates to `api.downloadJobResults`, which fetches the bytes
+   * with the Bearer token, wraps them in a Blob and clicks a synthetic `<a>`.
+   * A plain `<a href>` cannot be used because the endpoint requires the
+   * Authorization header. That also means the whole archive is buffered in
+   * memory before the save dialog appears — large result sets will spike RAM.
+   */
   const handleDownloadResults = useCallback(async () => {
     if (!id) return;
     setDownloadingResults(true);
@@ -396,6 +635,16 @@ export default function JobDetail() {
     }
   }, [id]);
 
+  /**
+   * Cancels the job (POST /api/jobs/{id}/cancel) and immediately refetches the
+   * detail so the header status and the Cancel button's visibility update
+   * without waiting for the next poll tick.
+   *
+   * AI Note: cancellation is asynchronous on the backend — the server marks
+   * the job and signals the agent, so the refetched status may still be
+   * `running` for a moment. The 3s poll (which keeps running until the status
+   * is terminal) is what eventually shows `cancelled`.
+   */
   const handleCancel = useCallback(async () => {
     if (!id) return;
     setCancelling(true);
@@ -419,9 +668,14 @@ export default function JobDetail() {
   }
 
   const { job, steps, context_data } = detail;
+  // May be undefined if the step list shrank (or is empty) while a later index
+  // was selected; the tab bodies all null-guard with `?.` and a placeholder.
   const currentStepData: StepRunInfo | undefined = steps[selectedStep];
   const isActive = ["pending", "queued", "running"].includes(job.status);
 
+  // AI Note: the Results tab is conditionally appended based on
+  // `detail.has_results`, so tab *positions* shift between jobs. Anything
+  // keying off index rather than `tab.key` will break.
   const tabs: Array<{ key: DetailTab; label: string }> = [
     { key: "logs", label: "Logs" },
     { key: "params", label: "Params" },
@@ -449,6 +703,9 @@ export default function JobDetail() {
           <div className="flex items-center gap-4 text-sm text-muted-foreground pl-9">
             <span>
               Submitted by{" "}
+              {/* AI Note: `submitted_by` is a user UUID, not a username — it is
+                  truncated to 8 chars purely as a compact identifier. There is
+                  currently no user lookup to resolve it to a display name. */}
               <span className="font-medium text-foreground">
                 {job.submitted_by.slice(0, 8)}
               </span>
@@ -501,6 +758,10 @@ export default function JobDetail() {
                   <button
                     key={step.id}
                     onClick={() => {
+                      // AI Note: switching steps also forces the Logs tab.
+                      // Params/Outputs are per-step, so leaving the user on
+                      // (say) Results after clicking a different step would
+                      // look like the click did nothing.
                       setSelectedStep(idx);
                       setActiveTab("logs");
                     }}
@@ -615,6 +876,13 @@ export default function JobDetail() {
                   <button
                     type="button"
                     onClick={() => {
+                      // AI Note: the terminal log is already in memory, so the
+                      // download is done entirely client-side via a Blob URL
+                      // rather than re-hitting the API (which would need the
+                      // Bearer header anyway). `revokeObjectURL` runs
+                      // synchronously after `click()`; this works because the
+                      // browser has already captured the blob by then — do not
+                      // "fix" it by awaiting anything in between.
                       const blob = new Blob([fullLog], { type: "text/plain" });
                       const url = URL.createObjectURL(blob);
                       const a = document.createElement("a");
@@ -688,6 +956,12 @@ export default function JobDetail() {
                       {art.storage_backend_name || art.storage_backend_id.slice(0, 8)}
                     </td>
                     <td className="px-4 py-2 text-right">
+                      {/* AI Note: unlike the results tarball, artifacts are
+                          downloaded with a plain <a href>. That only works if
+                          this endpoint accepts cookie/session auth or is
+                          unauthenticated — it cannot carry the Bearer token
+                          the rest of the client uses. If artifact downloads
+                          start 401ing, this is why. */}
                       <a
                         href={`/api/artifacts/${art.id}/download`}
                         className="inline-flex items-center gap-1 rounded-md p-1.5 text-muted-foreground hover:text-primary transition-colors"
