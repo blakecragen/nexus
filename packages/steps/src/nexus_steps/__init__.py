@@ -53,6 +53,7 @@ _STEP_MODULES = [
     "nexus_steps.gem5.collect_results",
     "nexus_steps.package.install",
     "nexus_steps.system.health_check",
+    "nexus_steps.system.update_software",
 ]
 
 

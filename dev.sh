@@ -183,6 +183,38 @@ install_python() {
     ok "Python packages installed."
 }
 
+# ── .pth un-hide watchdog ────────────────────────────────────────────────
+# CONFIRMED (2026-08-09) by a live probe: iCloud's sync daemon re-applies
+# UF_HIDDEN to a freshly-unhidden _editable_impl_*.pth file within ~2s, on
+# its own, with no pip/dev.sh running — this is an ONGOING background
+# behavior of syncing this repo through iCloud Drive, not a one-time
+# artifact of the install. The single post-install `chflags` call above only
+# wins the instant after a fresh `pip install -e`; iCloud can re-hide the
+# files again at any later point while the server keeps running, and the
+# NEXT `--reload` worker respawn then dies with a bare "ModuleNotFoundError:
+# No module named 'nexus_server'" that gives no hint why. So instead of a
+# one-shot fix, a background loop re-applies it once a second for the whole
+# life of the server — cheap (a no-op chflags call when already unhidden)
+# and small enough of a window that a reload landing mid-hidden is very
+# unlikely in practice.
+start_pth_watchdog() {
+    command -v chflags &>/dev/null || return 0
+    nohup bash -c "
+        while true; do
+            chflags nohidden '$SCRIPT_DIR'/.venv/lib/python*/site-packages/_editable_impl_nexus_*.pth 2>/dev/null
+            sleep 1
+        done
+    " > /dev/null 2>&1 &
+    echo $! > .nexus-pthwatch.pid
+}
+
+stop_pth_watchdog() {
+    if [[ -f .nexus-pthwatch.pid ]]; then
+        kill "$(cat .nexus-pthwatch.pid)" 2>/dev/null || true
+        rm -f .nexus-pthwatch.pid
+    fi
+}
+
 # ── API Server ──────────────────────────────────────────────────────────
 # Run uvicorn in the FOREGROUND (the `./dev.sh api` subcommand). Used when you
 # want the server's output inline and Ctrl-C to stop it; start_all runs the
@@ -194,6 +226,8 @@ install_python() {
 start_api() {
     load_env
     [[ -f .venv/bin/activate ]] && source .venv/bin/activate
+    start_pth_watchdog
+    trap stop_pth_watchdog EXIT INT TERM
     info "Starting API server on http://localhost:8000 ..."
     echo -e "  ${YELLOW}Press Ctrl+C to stop.${NC}"
     echo ""
@@ -268,6 +302,12 @@ start_all() {
     kill_port 8000
     kill_port 3000
 
+    # See start_pth_watchdog()'s comment: iCloud re-hides the editable-install
+    # .pth shims on its own schedule, not just right after pip install, so this
+    # must run for the API's whole lifetime, not once before start.
+    stop_pth_watchdog
+    start_pth_watchdog
+
     # Start API in background
     #
     # AI Note: the config is re-exported INSIDE the nohup'd subshell rather than
@@ -341,6 +381,8 @@ start_all() {
 # Redis/MinIO volumes across restarts.
 stop_all() {
     info "Stopping Nexus..."
+
+    stop_pth_watchdog
 
     if [[ -f .nexus-api.pid ]]; then
         local pid; pid=$(cat .nexus-api.pid)
@@ -429,6 +471,11 @@ show_status() {
         echo -e "  Frontend:   ${GREEN}running${NC} (PID $(cat .nexus-ui.pid))"
     else
         echo -e "  Frontend:   ${RED}stopped${NC}"
+    fi
+    if [[ -f .nexus-pthwatch.pid ]] && kill -0 "$(cat .nexus-pthwatch.pid)" 2>/dev/null; then
+        echo -e "  .pth watch: ${GREEN}running${NC} (PID $(cat .nexus-pthwatch.pid))"
+    else
+        echo -e "  .pth watch: ${RED}stopped${NC}  (iCloud may re-hide editable-install shims — see install_python())"
     fi
     echo ""
 }

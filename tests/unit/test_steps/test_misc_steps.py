@@ -62,6 +62,8 @@ from nexus_steps.docker.ensure_container import (
 )
 from nexus_steps.gem5.run_simulation import RunSimulationParams, RunSimulationStep
 from nexus_steps.gem5.collect_results import CollectResultsParams, CollectResultsStep
+from nexus_steps.system import update_software as update_software_mod
+from nexus_steps.system.update_software import UpdateSoftwareParams, UpdateSoftwareStep
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -2012,3 +2014,218 @@ def test_gem5_collect_container_mode_tar_failure(monkeypatch):
 def test_gem5_collect_cancel_noop():
     """cancel() is safe — tar and upload run synchronously inside startup()."""
     CollectResultsStep().cancel({})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# system/update_software.py
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _fake_update_run(seq):
+    """Build a subprocess.run stand-in that answers rev-parse calls from `seq` in order.
+
+    fetch/checkout/pip-install/chflags calls all succeed; only the two
+    rev-parse calls (pre- and post-update HEAD) return caller-supplied output,
+    mirroring the git_pull fakes above.
+    """
+    def _run(cmd, **kwargs):
+        if "rev-parse" in cmd:
+            return _FakeCompleted(0, stdout=seq.pop(0))
+        return _FakeCompleted(0)
+    return _run
+
+
+def test_update_software_metadata():
+    """Schema, output keys, and OS support are pinned — Windows has no nexusctl/launchd/systemd path."""
+    assert UpdateSoftwareStep.PARAMS_SCHEMA is UpdateSoftwareParams
+    assert UpdateSoftwareStep.OUTPUT_KEYS == ["commit_sha", "updated", "restart_scheduled"]
+    assert UpdateSoftwareStep.SUPPORTED_OS == ["macos", "linux"]
+
+
+def test_update_software_unknown_param_rejected():
+    """An unknown param is rejected even though every real field has a default."""
+    errors = UpdateSoftwareStep.validate_params({"q": 1})
+    assert "q" in _fields(errors)
+
+
+def test_update_software_default_packages_match_node_install_set():
+    """Reinstall targets mirror nexus_deploy.py's INSTALL_SH (common, steps, agent — no server).
+
+    Hardcoded (not a step param) — see the AI Note on _UPDATE_PACKAGES: a
+    list-typed param default hits a real to_schema()/JobBuilder bug where the
+    stringified default gets submitted back verbatim and fails Pydantic
+    validation, and there's no real use case for overriding it per job.
+    """
+    assert update_software_mod._UPDATE_PACKAGES == ["packages/common", "packages/steps", "packages/agent"]
+
+
+def test_detect_repo_dir_finds_real_root():
+    """_detect_repo_dir() walks up from its own __file__ to the actual repo root.
+
+    Runs against the real filesystem (this test suite lives inside the real
+    Nexus checkout), so this is a sanity check rather than a mock-based test.
+    """
+    repo_dir = update_software_mod._detect_repo_dir()
+    assert repo_dir is not None
+    from pathlib import Path
+    assert (Path(repo_dir) / ".git").is_dir()
+
+
+def test_update_software_autodetect_failure_errors(monkeypatch):
+    """A node whose repo_dir can't be auto-detected fails with a clear, actionable message."""
+    monkeypatch.setattr(update_software_mod, "_detect_repo_dir", lambda: None)
+    step = UpdateSoftwareStep()
+    state = step.startup({}, StepContext())
+    assert "could not auto-detect repo_dir" in state["error"]
+    assert step.check(state) is StepResult.FAILED
+
+
+def test_update_software_not_a_git_repo_errors(tmp_path):
+    """An explicit repo_dir lacking a .git directory fails before any subprocess runs."""
+    step = UpdateSoftwareStep()
+    state = step.startup({"repo_dir": str(tmp_path)}, StepContext())
+    assert "not a git repository" in state["error"]
+    assert step.check(state) is StepResult.FAILED
+
+
+def test_update_software_success_detects_update_and_schedules_restart(monkeypatch, tmp_path):
+    """A successful update reports the new sha, updated=True, and schedules exactly one restart.
+
+    Pins the restart cascade shape: launchd -> systemd --user -> nexusctl, each
+    falling through on failure, wrapped in a `sleep <restart_delay>` so the
+    step's own completion message has time to reach the server first.
+    """
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(
+        update_software_mod.subprocess, "run", _fake_update_run(["old_sha\n", "new_sha\n"])
+    )
+    popen_calls = []
+
+    def _fake_popen(cmd, **kwargs):
+        popen_calls.append((cmd, kwargs))
+        return object()
+
+    monkeypatch.setattr(update_software_mod.subprocess, "Popen", _fake_popen)
+
+    step = UpdateSoftwareStep()
+    state = step.startup({"repo_dir": str(tmp_path)}, StepContext())
+
+    assert state["commit_sha"] == "new_sha"
+    assert state["updated"] is True
+    assert state["restart_scheduled"] is True
+    assert state["done"] is True
+    assert step.check(state) is StepResult.SUCCESS
+
+    assert len(popen_calls) == 1
+    cmd, kwargs = popen_calls[0]
+    assert cmd[0] == "bash" and cmd[1] == "-c"
+    script = cmd[2]
+    assert "sleep 3.0" in script
+    assert "launchctl kickstart" in script
+    assert "systemctl --user restart nexus-agent" in script
+    assert f"{tmp_path}/nexusctl restart" in script
+    assert kwargs.get("start_new_session") is True
+
+
+def test_update_software_no_change_reports_not_updated(monkeypatch, tmp_path):
+    """An unchanged sha reports updated=False so downstream steps can skip work."""
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(
+        update_software_mod.subprocess, "run", _fake_update_run(["same_sha\n", "same_sha\n"])
+    )
+    monkeypatch.setattr(update_software_mod.subprocess, "Popen", lambda *a, **k: object())
+
+    step = UpdateSoftwareStep()
+    state = step.startup({"repo_dir": str(tmp_path)}, StepContext())
+    assert state["updated"] is False
+    assert state["commit_sha"] == "same_sha"
+
+
+def test_update_software_fetch_failure_errors_and_skips_restart(monkeypatch, tmp_path):
+    """A failed fetch (e.g. unreachable remote) fails the step and never schedules a restart."""
+    (tmp_path / ".git").mkdir()
+
+    def _fake_run(cmd, **kwargs):
+        if "rev-parse" in cmd:
+            return _FakeCompleted(0, stdout="sha\n")
+        if "fetch" in cmd:
+            raise subprocess.CalledProcessError(1, cmd, stderr="could not resolve host")
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(update_software_mod.subprocess, "run", _fake_run)
+    popen_calls = []
+    monkeypatch.setattr(
+        update_software_mod.subprocess, "Popen",
+        lambda *a, **k: popen_calls.append((a, k)),
+    )
+
+    step = UpdateSoftwareStep()
+    state = step.startup({"repo_dir": str(tmp_path)}, StepContext())
+    assert "git update failed" in state["error"]
+    assert step.check(state) is StepResult.FAILED
+    assert popen_calls == []
+
+
+def test_update_software_fetch_timeout_errors(monkeypatch, tmp_path):
+    """A fetch that exceeds its timeout is reported as a timeout error."""
+    (tmp_path / ".git").mkdir()
+
+    def _fake_run(cmd, **kwargs):
+        if "rev-parse" in cmd:
+            return _FakeCompleted(0, stdout="sha\n")
+        raise subprocess.TimeoutExpired(cmd, 120)
+
+    monkeypatch.setattr(update_software_mod.subprocess, "run", _fake_run)
+    step = UpdateSoftwareStep()
+    state = step.startup({"repo_dir": str(tmp_path)}, StepContext())
+    assert "timed out" in state["error"]
+
+
+def test_update_software_pip_install_failure_errors_and_skips_restart(monkeypatch, tmp_path):
+    """A failed reinstall fails the step (with the new sha still reported) and skips the restart."""
+    (tmp_path / ".git").mkdir()
+
+    def _fake_run(cmd, **kwargs):
+        if "rev-parse" in cmd:
+            return _FakeCompleted(0, stdout="sha\n")
+        if "pip" in cmd:
+            return _FakeCompleted(returncode=1, stderr="No matching distribution found")
+        return _FakeCompleted(0)  # fetch / checkout
+
+    monkeypatch.setattr(update_software_mod.subprocess, "run", _fake_run)
+    popen_calls = []
+    monkeypatch.setattr(
+        update_software_mod.subprocess, "Popen",
+        lambda *a, **k: popen_calls.append((a, k)),
+    )
+
+    step = UpdateSoftwareStep()
+    state = step.startup({"repo_dir": str(tmp_path)}, StepContext())
+    assert "pip install failed" in state["error"]
+    assert state["commit_sha"] == "sha"
+    assert step.check(state) is StepResult.FAILED
+    assert popen_calls == []
+
+
+def test_update_software_restart_false_skips_scheduling(monkeypatch, tmp_path):
+    """restart=False completes the update but never touches subprocess.Popen."""
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(
+        update_software_mod.subprocess, "run", _fake_update_run(["sha\n", "sha\n"])
+    )
+    popen_calls = []
+    monkeypatch.setattr(
+        update_software_mod.subprocess, "Popen",
+        lambda *a, **k: popen_calls.append((a, k)),
+    )
+
+    step = UpdateSoftwareStep()
+    state = step.startup({"repo_dir": str(tmp_path), "restart": False}, StepContext())
+    assert state["restart_scheduled"] is False
+    assert popen_calls == []
+
+
+def test_update_software_cancel_noop():
+    """cancel() is safe — the update runs synchronously inside startup(), and an
+    already-scheduled restart has no handle here to cancel."""
+    UpdateSoftwareStep().cancel({})
