@@ -48,8 +48,6 @@ Status-code contract exercised here
 
 from __future__ import annotations
 
-import ast
-
 import pytest
 from pydantic import BaseModel, Field
 from pydantic_core import PydanticUndefined
@@ -271,7 +269,8 @@ def test_to_schema_never_leaks_the_pydantic_undefined_sentinel():
     encoding would either stringify it or fail), so the same sweep is repeated
     against ``to_schema()`` directly. The belt-and-braces ``is PydanticUndefined``
     check in the source is exactly what this asserts, and every published default
-    is additionally required to be a JSON-safe scalar or ``None``.
+    is additionally required to be a JSON-safe value: a scalar, ``None``, or a
+    (possibly nested) list/dict of the same.
     """
     for name in list_steps():
         schema = STEP_REGISTRY[name].to_schema()
@@ -281,24 +280,26 @@ def test_to_schema_never_leaks_the_pydantic_undefined_sentinel():
             assert not (isinstance(default, str) and "PydanticUndefined" in default), (
                 name, field["name"], default,
             )
-            assert default is None or isinstance(default, (str, int, float, bool)), (
+            assert default is None or isinstance(default, (str, int, float, bool, list, dict)), (
                 name, field["name"], type(default),
             )
 
 
 def test_probe_step_default_factory_defaults_are_resolved_by_calling_the_factory():
-    """A ``default_factory`` field publishes the factory's *value*, not the sentinel.
+    """A ``default_factory`` field publishes the factory's *value* as real JSON, not the sentinel.
 
     The narrowest possible pin on the fix, using a locally declared step so it
     holds regardless of what ``nexus_steps`` contains. Covers all three factory
-    outcomes: a non-empty list and a dict are stringified (JSON-safe display
-    hints), while a factory returning a primitive keeps its native type.
+    outcomes: a non-empty list and a dict are published as their actual JSON
+    value (not a stringified repr — see the module docstring on
+    ``to_schema()``'s list/dict serialization fix), while a factory returning a
+    primitive keeps its native type.
     """
     schema = _ProbeStep.to_schema()
     fields = _fields_by_name(schema)
 
-    assert fields["tags"]["default"] == "['alpha', 'beta']"
-    assert fields["mapping"]["default"] == "{}"
+    assert fields["tags"]["default"] == ["alpha", "beta"]
+    assert fields["mapping"]["default"] == {}
     assert fields["retries"]["default"] == 7
     assert isinstance(fields["retries"]["default"], int)
     for name in ("tags", "mapping", "retries"):
@@ -342,9 +343,12 @@ def test_registered_steps_with_list_factories_publish_their_real_defaults(auth_c
 
     Complements the probe step by asserting the shipped steps that actually use
     ``default_factory`` — the ones that used to display ``PydanticUndefined`` in
-    the UI. Each published default must round-trip through ``literal_eval`` back
-    into the container the factory produces, which is a much stronger statement
-    than "is not the sentinel".
+    the UI. Each published default must be the ACTUAL list/dict as real JSON,
+    not a stringified repr: JobBuilder's buildDefaultParams() pre-fills the
+    step's form with this value and posts it straight back on submit, and a
+    stringified default (e.g. ``"['cpu', 'memory']"``) used to be submitted
+    back as a string and rejected by Pydantic with "Input should be a valid
+    list" — meaning a step couldn't even be submitted with its own defaults.
     """
     resp = auth_client.get("/api/steps")
     assert resp.status_code == 200, resp.text
@@ -361,8 +365,8 @@ def test_registered_steps_with_list_factories_publish_their_real_defaults(auth_c
     for (step_name, field_name), want in expected.items():
         field = _fields_by_name(_step_by_name(body, step_name))[field_name]
         assert field["required"] is False, (step_name, field_name)
-        assert isinstance(field["default"], str), (step_name, field_name, field["default"])
-        assert ast.literal_eval(field["default"]) == want, (step_name, field_name)
+        assert field["default"] == want, (step_name, field_name, field["default"])
+        assert type(field["default"]) is type(want), (step_name, field_name)
 
 
 def test_registered_steps_scalar_defaults_keep_their_native_json_type(auth_client):

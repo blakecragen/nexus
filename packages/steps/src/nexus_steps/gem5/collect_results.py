@@ -36,7 +36,6 @@ equivalent in effect; treat the code as authoritative.
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import tempfile
 from typing import Any
@@ -51,39 +50,15 @@ from nexus_common.steps.base import (
     StepContext,
 )
 from nexus_common.steps.registry import register
+from nexus_steps.docker.util import docker_missing_error, ensure_daemon, find_docker
 
-
-def _find_docker(explicit: str | None) -> str | None:
-    """Locate the ``docker`` CLI on this node.
-
-    Args:
-        explicit: A caller-supplied path, returned as-is without validation.
-
-    Returns:
-        Path to a docker binary, or ``None`` if none was found.
-
-    AI Note: the PATH lookup alone is insufficient because agents typically run
-    as a LaunchAgent/systemd unit with a minimal PATH that omits
-    ``/usr/local/bin`` and ``/opt/homebrew/bin``; the hardcoded candidates are
-    the workaround.
-
-    AI Note: duplicated verbatim in ``nexus_steps.docker.ensure_container`` and
-    ``nexus_steps.gem5.run_simulation``. Keep all three in sync.
-    """
-    if explicit:
-        return explicit
-    found = shutil.which("docker")
-    if found:
-        return found
-    for cand in (
-        "/usr/local/bin/docker",
-        "/opt/homebrew/bin/docker",
-        os.path.expanduser("~/.docker/bin/docker"),
-        "/Applications/Docker.app/Contents/Resources/bin/docker",
-    ):
-        if os.path.exists(cand):
-            return cand
-    return None
+# Docker discovery lives in ``nexus_steps.docker.util`` — this used to be a
+# third verbatim copy alongside ``docker/ensure_container.py`` and
+# ``gem5/run_simulation.py``.
+#
+# AI Note: keep calling the shared helper through this module-level alias;
+# unit tests monkeypatch it by name on this module.
+_find_docker = find_docker
 
 
 # ── Params ───────────────────────────────────────────────────────────────
@@ -108,6 +83,19 @@ class CollectResultsParams(BaseModel):
     )
     docker: str | None = Field(
         None, description="Path to the docker binary (auto-detected when omitted).",
+    )
+    auto_start_daemon: bool = Field(
+        True,
+        description=(
+            "Container mode only: if the Docker daemon isn't running, try to "
+            "start it and wait for it to be ready before reading the results."
+        ),
+    )
+    daemon_wait: int = Field(
+        120,
+        description="Seconds to wait for the Docker daemon to become ready.",
+        ge=1,
+        le=3600,
     )
 
 
@@ -179,9 +167,10 @@ class CollectResultsStep(FlowStep):
 
         Side effects:
             Creates a temp ``.tar.gz`` on the host (always removed in the
-            ``finally`` block), may run ``docker exec ... tar`` inside the
-            container, and performs an authenticated HTTP PUT that persists the
-            archive server-side against this job.
+            ``finally`` block), may start the Docker daemon and run
+            ``docker exec ... tar`` inside the container, and performs an
+            authenticated HTTP PUT that persists the archive server-side
+            against this job.
 
         AI Note: every failure is reported by *returning* an ``error`` state
         rather than raising, including the catch-all ``except Exception``. This
@@ -210,7 +199,18 @@ class CollectResultsStep(FlowStep):
                 # archive to the host file, so we never touch the path on the host.
                 docker = _find_docker(validated.docker)
                 if not docker:
-                    return {"error": "docker binary not found on node"}
+                    return {"error": docker_missing_error()}
+                # A daemon that died mid-job (Docker Desktop quit, laptop slept)
+                # otherwise surfaces below as "tar in container failed: Cannot
+                # connect to the Docker daemon...", which reads like a tar bug.
+                # Probe first so the message names the real cause — and, by
+                # default, bring the daemon back so the results aren't lost
+                # after the simulation already succeeded.
+                daemon_err = ensure_daemon(
+                    docker, validated.auto_start_daemon, validated.daemon_wait,
+                )
+                if daemon_err:
+                    return {"error": daemon_err}
                 # AI Note: `tar -C <parent> <base>` rather than tarring the
                 # absolute path keeps the archive rooted at the m5out directory
                 # name, so extraction produces ./m5out_nexus_xxxx/ instead of a

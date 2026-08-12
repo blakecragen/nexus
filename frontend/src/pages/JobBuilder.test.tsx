@@ -278,6 +278,24 @@ function renderBuilder() {
   return { user, ...view };
 }
 
+/**
+ * Same, but arriving with the router state that JobDetail's "Duplicate" button
+ * pushes. This is the entire input to the prefill path — there is no request,
+ * so a `MemoryRouter` entry carrying `state` reproduces it exactly.
+ */
+function renderBuilderWithPrefill(prefill: unknown) {
+  const user = userEvent.setup();
+  const view = render(
+    <MemoryRouter initialEntries={[{ pathname: "/jobs/new", state: { prefill } }]}>
+      <Routes>
+        <Route path="/jobs/new" element={<JobBuilder />} />
+        <Route path="/jobs/:id" element={<JobDetailProbe />} />
+      </Routes>
+    </MemoryRouter>
+  );
+  return { user, ...view };
+}
+
 // ── Query helpers ───────────────────────────────────────────────────────────
 
 /**
@@ -1066,6 +1084,214 @@ describe("JobBuilder — target and priority controls", () => {
       "Normal",
       "Low",
     ]);
+  });
+});
+
+// ── Prefill (the "Duplicate" handoff from JobDetail) ────────────────────────
+
+/**
+ * Arriving with `location.state.prefill` seeds the whole form from an existing
+ * job's stored plan, then behaves like any hand-built pipeline: everything is
+ * editable and nothing is created until Submit.
+ */
+describe("JobBuilder — prefill from a duplicated job", () => {
+  /** The plan JobDetail hands over for a two-step job. */
+  const twoStepPlan = [
+    { step: "shell_run", params: { command: "make build", timeout: 90, capture: true } },
+    { step: "gem5_run", params: { binary: "/bin/hello" } },
+  ];
+
+  it("seeds the job name from the prefill", () => {
+    renderBuilderWithPrefill({ name: "nightly-build", steps: twoStepPlan });
+
+    expect(jobNameInput()).toHaveValue("nightly-build");
+  });
+
+  /**
+   * Steps land on the canvas in plan order. Regression guarded: rebuilding
+   * cards from schema defaults instead of the plan, which silently produces a
+   * *different* job than the one being duplicated.
+   */
+  it("seeds the canvas with the plan's steps in order", () => {
+    renderBuilderWithPrefill({ name: "nightly-build", steps: twoStepPlan });
+
+    expect(canvasRows()).toEqual([
+      { position: "1", step: "shell_run" },
+      { position: "2", step: "gem5_run" },
+    ]);
+  });
+
+  /** Each card gets a fresh client-side id, or React keys and dnd-kit collide. */
+  it("gives every prefilled card a distinct client-side id", () => {
+    renderBuilderWithPrefill({ name: "n", steps: twoStepPlan });
+
+    const ids = cardIds();
+    expect(ids).toHaveLength(2);
+    expect(new Set(ids).size).toBe(2);
+  });
+
+  /** The first step is selected so the editor opens on something useful. */
+  it("opens the parameter editor on the first prefilled step", () => {
+    renderBuilderWithPrefill({ name: "n", steps: twoStepPlan });
+
+    expect(screen.getByPlaceholderText("e.g. echo hi")).toHaveValue("make build");
+  });
+
+  /**
+   * The param *values* come from the plan, not the schema defaults — including
+   * a value that happens to equal neither (`timeout: 90` vs the schema's 30).
+   */
+  it("seeds param values from the plan rather than schema defaults", () => {
+    renderBuilderWithPrefill({ name: "n", steps: twoStepPlan });
+
+    expect(screen.getByDisplayValue("90")).toBeInTheDocument();
+  });
+
+  /** Node pin wins over pool when the original had both. */
+  it("selects Node mode when the original was pinned to a node", () => {
+    renderBuilderWithPrefill({
+      name: "n",
+      steps: twoStepPlan,
+      target_pool_id: poolA.id,
+      target_node_id: onlineNode.id,
+    });
+
+    expect(selectWithOption("-- Select Node --")).toHaveValue(onlineNode.id);
+    expect(screen.queryByRole("option", { name: "-- Select Pool --" })).not.toBeInTheDocument();
+  });
+
+  it("stays in Pool mode and selects the pool when only a pool was targeted", () => {
+    renderBuilderWithPrefill({ name: "n", steps: twoStepPlan, target_pool_id: poolA.id });
+
+    expect(selectWithOption("-- Select Pool --")).toHaveValue(poolA.id);
+  });
+
+  it("maps the numeric priority back to its label", () => {
+    renderBuilderWithPrefill({ name: "n", steps: twoStepPlan, priority: 10 });
+
+    expect(selectWithOption("High")).toHaveValue("high");
+  });
+
+  /**
+   * The three-label selector cannot represent every integer, so an off-scale
+   * priority snaps to the nearest label. Documents the loss rather than
+   * pretending it does not happen: the one-click Re-run path copies the exact
+   * integer server-side and never comes through here.
+   */
+  it("snaps an off-scale priority to the nearest label", () => {
+    renderBuilderWithPrefill({ name: "n", steps: twoStepPlan, priority: 8 });
+
+    expect(selectWithOption("High")).toHaveValue("high");
+  });
+
+  /**
+   * A duplicated plan must round-trip unchanged when submitted untouched.
+   * Regression guarded: the builder rewriting params it has no UI for, which
+   * would turn "duplicate" into "duplicate, approximately".
+   */
+  it("re-submits a duplicated plan unchanged", async () => {
+    const { user } = renderBuilderWithPrefill({
+      name: "nightly-build",
+      steps: twoStepPlan,
+      priority: 10,
+    });
+
+    await user.click(submitButton());
+
+    expect(h.submitJob).toHaveBeenCalledWith({
+      name: "nightly-build",
+      steps: [
+        { step: "shell_run", params: { command: "make build", timeout: 90, capture: true } },
+        { step: "gem5_run", params: { binary: "/bin/hello" } },
+      ],
+      target_pool_id: undefined,
+      target_node_id: undefined,
+      priority: 10,
+    });
+  });
+
+  /**
+   * `on_fail` and the per-step `target_*` fields have no UI here — only the
+   * `.nexus` DSL parser produces them. They must survive a duplicate anyway.
+   *
+   * Regression guarded: dropping them, which silently rewrites a
+   * continue-on-failure step to stop-on-failure and unpins it from its node —
+   * a different pipeline wearing the same name.
+   */
+  it("carries per-step on_fail and target fields through a duplicate", async () => {
+    const { user } = renderBuilderWithPrefill({
+      name: "dsl-job",
+      steps: [
+        {
+          step: "shell_run",
+          params: { command: "make build" },
+          on_fail: "continue",
+          target_node_id: onlineNode.id,
+          target_os: "linux",
+        },
+      ],
+    });
+
+    await user.click(submitButton());
+
+    expect(h.submitJob).toHaveBeenCalledWith(
+      expect.objectContaining({
+        steps: [
+          {
+            step: "shell_run",
+            params: { command: "make build" },
+            on_fail: "continue",
+            target_node_id: onlineNode.id,
+            target_os: "linux",
+          },
+        ],
+      })
+    );
+  });
+
+  /** A prefilled plan is a starting point, not a fixed one. */
+  it("lets a prefilled step be edited before submitting", async () => {
+    const { user } = renderBuilderWithPrefill({ name: "editable", steps: twoStepPlan });
+
+    const commandInput = screen.getByPlaceholderText("e.g. echo hi");
+    await user.clear(commandInput);
+    await user.type(commandInput, "make test");
+    await user.click(submitButton());
+
+    expect(h.submitJob).toHaveBeenCalledWith(
+      expect.objectContaining({
+        steps: expect.arrayContaining([
+          expect.objectContaining({
+            params: expect.objectContaining({ command: "make test" }),
+          }),
+        ]),
+      })
+    );
+  });
+
+  /**
+   * A step type the server no longer advertises must still render, so the user
+   * can see what to replace. Regression guarded: dropping unknown steps from
+   * the canvas, which would quietly submit an incomplete pipeline.
+   */
+  it("keeps a step whose schema the server no longer advertises", () => {
+    renderBuilderWithPrefill({
+      name: "stale",
+      steps: [{ step: "since_removed", params: { foo: 1 } }],
+    });
+
+    expect(canvasRows()).toEqual([{ position: "1", step: "since_removed" }]);
+  });
+
+  /**
+   * No router state (a direct visit, or a browser reload that dropped it)
+   * leaves the builder exactly as it was before this feature existed.
+   */
+  it("renders an empty builder when no prefill was passed", () => {
+    renderBuilder();
+
+    expect(jobNameInput()).toHaveValue("");
+    expect(cards()).toHaveLength(0);
   });
 });
 

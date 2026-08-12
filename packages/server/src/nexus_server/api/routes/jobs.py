@@ -1,12 +1,12 @@
-"""Job management routes — list, submit, detail, cancel, delete, results.
+"""Job management routes — list, submit, detail, requeue, cancel, delete, results.
 
 Mounted at ``/api/jobs`` by ``nexus_server.main.create_app()``. This is the
 busiest router in the server and the seam between three very different callers:
 
 * **The dashboard** (``frontend/src/pages/Jobs.tsx``, ``JobBuilder.tsx``,
   ``JobDetail.tsx`` via ``frontend/src/api/client.ts``) — authenticates with a
-  user JWT and drives list / submit / detail / cancel / delete plus the log and
-  results views.
+  user JWT and drives list / submit / detail / requeue / cancel / delete plus
+  the log and results views.
 * **The job runner** (``nexus_server.runner.JobRunner``, injected as the
   ``Runner`` dependency) — this module never executes a step itself. It persists
   the job row and hands the id to the runner, which schedules steps onto agents
@@ -41,7 +41,9 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, Request, UploadFile, status
 from fastapi.responses import FileResponse, PlainTextResponse
 
-from nexus_common.models.schemas import JobDetail, JobInfo, JobSubmit, StepRunInfo
+from nexus_common.models.schemas import (
+    JobDetail, JobInfo, JobSubmit, StepConfig, StepRunInfo,
+)
 from nexus_common.steps.registry import STEP_REGISTRY
 from nexus_server.api.deps import CurrentUser, DbSession, Runner
 from nexus_server.db import ops
@@ -132,6 +134,105 @@ def _step_run_to_info(sr) -> StepRunInfo:
     )
 
 
+def _parse_steps_config(raw) -> list[StepConfig]:
+    """Parse a ``Job.steps_config`` JSON column into typed step configs, leniently.
+
+    Args:
+        raw: The column value — normally a list of dicts produced by
+            ``StepConfig.model_dump()``. ``None`` and non-list values are
+            tolerated.
+
+    Returns:
+        list[StepConfig]: The parsed plan, or ``[]`` if it does not parse.
+
+    AI Note: swallowing the parse error is deliberate and is the *read* path's
+    policy only — see the call site in ``get_job``. Callers that act on the plan
+    (``requeue_job``) must parse it themselves and report the failure, not reuse
+    this.
+    """
+    if not isinstance(raw, list):
+        return []
+    try:
+        return [StepConfig(**s) for s in raw]
+    except (TypeError, ValueError):
+        # ValueError covers pydantic's ValidationError; TypeError covers a
+        # non-mapping entry (e.g. a bare string) reaching the ** unpack.
+        return []
+
+
+def _validate_steps(steps: list[StepConfig]) -> None:
+    """Validate a whole job plan the way submission does, or raise 400.
+
+    Shared by ``submit_job`` (validating what the caller just sent) and
+    ``requeue_job`` (re-validating a plan that was stored possibly months ago).
+    Fail-fast and side-effect free, so a rejected plan leaves no database row
+    behind in either caller.
+
+    Each step is checked twice over: that its ``step`` names something in
+    ``STEP_REGISTRY``, and that its ``params`` satisfy the step class's own
+    ``validate_params`` against a context accumulated from everything upstream.
+    That context is what lets a step reference an output an earlier step has not
+    produced yet (``m5out_path`` and friends) without being rejected.
+
+    Args:
+        steps: The ordered plan. Index into this list is what the error messages
+            report, so callers must pass it in submission order.
+
+    Returns:
+        None. The only signal is the exception.
+
+    Raises:
+        HTTPException: 400 naming the offending step index and the reason —
+            either an unknown step name (with the available names listed) or the
+            joined validation errors.
+
+    AI Note: this mirrors, at submission time, the context the runner will build
+    at execution time. If a step type's ``OUTPUT_KEYS`` and the keys it actually
+    returns ever diverge, a job will validate here and then fail at runtime with
+    a missing-parameter error — that pairing is load-bearing.
+    """
+    # AI Note: imported lazily inside the function rather than at module scope.
+    # Importing nexus_common.steps.base at import time would pull the step
+    # machinery into every module that touches the routes package; keeping it
+    # local also keeps the STEP_REGISTRY import above as the only hard
+    # dependency on the step system.
+    from nexus_common.steps.base import StepContext
+
+    val_ctx = StepContext()
+    for i, step_cfg in enumerate(steps):
+        if step_cfg.step not in STEP_REGISTRY:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Step {i} references unknown step '{step_cfg.step}'. "
+                       f"Available: {sorted(STEP_REGISTRY.keys())}",
+            )
+
+        # Run parameter validation on each step against the accumulated context.
+        step_cls = STEP_REGISTRY[step_cfg.step]
+        errors = step_cls.validate_params(step_cfg.params, val_ctx)
+        if errors:
+            detail = "; ".join(str(e) for e in errors)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Step {i} ('{step_cfg.step}') validation failed: {detail}",
+            )
+
+        # This step's outputs become available to later steps.
+        #
+        # AI Note: values are seeded as None because only *presence* of the key
+        # matters to the "context-satisfiable" input rules — the real value is
+        # unknown until the step runs. Pass-3 type validation in
+        # validate_params() resolves the context, so a None placeholder must
+        # never be the only source for a field a downstream step type-checks.
+        for k in getattr(step_cls, "OUTPUT_KEYS", []):
+            val_ctx.outputs[k] = None
+        # AI Note: explicit params are merged in after the None placeholders so a
+        # concretely-supplied value wins over an upstream step's placeholder for
+        # the same key. Order here is deliberate; swapping these two statements
+        # would blank out real values.
+        val_ctx.outputs.update(step_cfg.params)
+
+
 @router.get("", response_model=list[JobInfo])
 async def list_jobs(
     db: DbSession,
@@ -209,54 +310,10 @@ async def submit_job(body: JobSubmit, db: DbSession, user: CurrentUser, runner: 
         Inserts and commits a ``jobs`` row, then spawns a background asyncio task
         via ``runner.submit_job``. No ``step_runs`` rows are created here.
     """
-    # AI Note: imported lazily inside the handler rather than at module scope.
-    # Importing nexus_common.steps.base at import time would pull the step
-    # machinery into every module that touches the routes package; keeping it
-    # local also keeps the STEP_REGISTRY import above as the only hard
-    # dependency on the step system.
-    from nexus_common.steps.base import StepContext
-
     # Validate each step, accumulating a context of what upstream steps will
     # provide (their declared OUTPUT_KEYS + any explicit params) so that
     # context-satisfiable fields downstream (e.g. m5out_path) validate correctly.
-    #
-    # AI Note: this mirrors, at submission time, the context the runner will
-    # build at execution time. If a step type's OUTPUT_KEYS and the keys it
-    # actually returns ever diverge, a job will validate here and then fail at
-    # runtime with a missing-parameter error — that pairing is load-bearing.
-    val_ctx = StepContext()
-    for i, step_cfg in enumerate(body.steps):
-        if step_cfg.step not in STEP_REGISTRY:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Step {i} references unknown step '{step_cfg.step}'. "
-                       f"Available: {sorted(STEP_REGISTRY.keys())}",
-            )
-
-        # Run parameter validation on each step against the accumulated context.
-        step_cls = STEP_REGISTRY[step_cfg.step]
-        errors = step_cls.validate_params(step_cfg.params, val_ctx)
-        if errors:
-            detail = "; ".join(str(e) for e in errors)
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Step {i} ('{step_cfg.step}') validation failed: {detail}",
-            )
-
-        # This step's outputs become available to later steps.
-        #
-        # AI Note: values are seeded as None because only *presence* of the key
-        # matters to the "context-satisfiable" input rules — the real value is
-        # unknown until the step runs. Pass-3 type validation in
-        # validate_params() resolves the context, so a None placeholder must
-        # never be the only source for a field a downstream step type-checks.
-        for k in getattr(step_cls, "OUTPUT_KEYS", []):
-            val_ctx.outputs[k] = None
-        # AI Note: explicit params are merged in after the None placeholders so a
-        # concretely-supplied value wins over an upstream step's placeholder for
-        # the same key. Order here is deliberate; swapping these two statements
-        # would blank out real values.
-        val_ctx.outputs.update(step_cfg.params)
+    _validate_steps(body.steps)
 
     # Persist job. Step runs are created lazily by the runner on each
     # iteration so loops produce one row per attempt at the same step_index.
@@ -293,9 +350,10 @@ async def get_job(job_id: UUID, db: DbSession, user: CurrentUser):
 
     Returns:
         JobDetail: The job summary, every step run ordered by ``step_index``
-        (with repeats for loop iterations), the accumulated ``context_data``,
-        and two booleans the UI uses to decide whether to render the log tab and
-        the results tree/download button.
+        (with repeats for loop iterations), the submitted plan as
+        ``steps_config``, the accumulated ``context_data``, and two booleans the
+        UI uses to decide whether to render the log tab and the results
+        tree/download button.
 
     Raises:
         HTTPException: 404 if no such job.
@@ -307,6 +365,17 @@ async def get_job(job_id: UUID, db: DbSession, user: CurrentUser):
     return JobDetail(
         job=_job_to_info(job),
         steps=[_step_run_to_info(sr) for sr in step_runs],
+        # The stored plan, handed back so the dashboard's "Duplicate" can
+        # pre-fill the Job Builder without a second round trip.
+        #
+        # AI Note: degrades to [] rather than raising if the stored plan does not
+        # parse against the current StepConfig. This endpoint is polled every 3s
+        # by the detail page and serves the log/results tabs too — a job with a
+        # hand-edited or schema-drifted plan must stay *inspectable*, which is
+        # exactly when you need to read its log. The frontend hides Duplicate on
+        # an empty list. POST /{id}/requeue makes the opposite trade and reports
+        # the parse failure as a 400, because there the plan is the whole point.
+        steps_config=_parse_steps_config(job.steps_config),
         context_data=job.context_data or {},
         has_log=bool(job.log_text),
         # AI Note: has_results is derived from the filesystem, not the DB, so it
@@ -551,6 +620,87 @@ async def cancel_job(job_id: UUID, db: DbSession, user: CurrentUser, runner: Run
     await runner.cancel_job(db, job_id)
     job = await ops.get_job_by_id(db, job_id)
     return _job_to_info(job)
+
+
+@router.post("/{job_id}/requeue", response_model=JobInfo, status_code=status.HTTP_201_CREATED)
+async def requeue_job(job_id: UUID, db: DbSession, user: CurrentUser, runner: Runner):
+    """Re-submit a job's plan verbatim as a brand new job.
+
+    Serves ``POST /api/jobs/{job_id}/requeue`` — the dashboard's "Re-run" button
+    on the Jobs table and the Job Detail header. Takes no request body: the
+    whole point is an exact copy, so there is nothing to configure.
+
+    Copied from the original: ``name`` (no "(retry N)" suffix — attempts are
+    told apart by ``created_at``), ``steps_config``, ``target_pool_id``,
+    ``target_node_id``, ``priority`` and ``storage_target``.
+
+    Args:
+        job_id: Job whose plan to re-submit. Left completely untouched.
+        db: Async session, injected.
+        user: Authenticated caller. Recorded as the new job's ``submitted_by``.
+        runner: ``JobRunner`` singleton, injected.
+
+    Returns:
+        JobInfo: The *new* job, 201, ``status="pending"``. The caller gets a new
+        id — this never returns the original.
+
+    Raises:
+        HTTPException: 404 if no such job; 400 if the stored plan no longer
+            parses or no longer validates (a step type that has since been
+            renamed or removed, or whose ``PARAMS_SCHEMA`` tightened).
+
+    Side effects:
+        Inserts and commits a new ``jobs`` row, then spawns a background
+        asyncio task via ``runner.submit_job``.
+
+    AI Note: nothing but the plan and its targeting carries over. ``context_data``,
+    ``log_text``, ``current_step``, ``error`` and the results tarball under
+    ``RESULTS_DIR`` all describe the *old* attempt; the new job starts clean and
+    re-resolves its own ``${...}`` references from scratch. That is why the plan
+    (``steps_config``, which keeps placeholders intact) is the right source and
+    ``StepRun.input_params`` (already resolved against the old run's context) is
+    not.
+
+    AI Note: unlike ``cancel_job`` and ``delete_job``, this deliberately does NOT
+    409 on job state — requeueing a still-``running`` job is well-defined,
+    because the result is an independent job that shares nothing but its plan.
+    The dashboard only offers the button on terminal jobs; that is a UX choice,
+    not a rule this endpoint enforces.
+
+    AI Note (authorization): no ownership check — any authenticated user can
+    requeue any job, and the copy is attributed to *them*, not to the original
+    submitter. Same single-tenant assumption as the rest of this router.
+    """
+    job = await ops.get_job_by_id(db, job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    # Strict parse, unlike the lenient one in get_job: acting on a plan we cannot
+    # read would queue a job that is certain to fail at dispatch time.
+    try:
+        steps = [StepConfig(**s) for s in (job.steps_config or [])]
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Stored job plan could not be read: {exc}",
+        )
+
+    # Re-validate rather than trusting the stored plan. The registry is a
+    # property of the *current* server build, so a plan that validated at
+    # submission can be stale — better a readable 400 here than a job queued
+    # into a guaranteed runtime failure.
+    _validate_steps(steps)
+
+    new_job = await ops.create_job(
+        db, name=job.name, submitted_by=user.id,
+        steps_config=[s.model_dump(mode="json") for s in steps],
+        target_pool_id=job.target_pool_id, target_node_id=job.target_node_id,
+        priority=job.priority, storage_target=job.storage_target,
+    )
+
+    await runner.submit_job(db, new_job.id)
+
+    return _job_to_info(new_job)
 
 
 @router.delete("/{job_id}", status_code=status.HTTP_204_NO_CONTENT)

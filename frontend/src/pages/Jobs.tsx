@@ -5,14 +5,14 @@
  *   Primary operator view for everything that has been submitted to the
  *   cluster. Renders one row per job with live-updating status, and exposes the
  *   only two destructive job actions in the UI: cancel (in-flight jobs) and
- *   delete (terminal jobs).
+ *   delete (terminal jobs). Terminal rows also get a non-destructive re-run.
  *
  * Data flow:
  *   - Reads/refreshes `useJobsStore` (`frontend/src/stores/index.ts`) ->
  *     GET /api/jobs (optionally `?status=`).
  *   - Mutations go straight through `api` (`frontend/src/api/client.ts`):
- *     POST /api/jobs/{id}/cancel and DELETE /api/jobs/{id}, each followed by a
- *     store refetch.
+ *     POST /api/jobs/{id}/cancel, POST /api/jobs/{id}/requeue and
+ *     DELETE /api/jobs/{id}, each followed by a store refetch.
  *   - Live status changes arrive out-of-band: `<Layout />` owns the
  *     `/ws/dashboard` socket and `handleWsMessage` calls
  *     `useJobsStore.updateJobStatus()`, mutating rows already on screen.
@@ -28,6 +28,7 @@ import {
   XCircle,
   Trash2,
   ChevronDown,
+  RotateCcw,
 } from "lucide-react";
 import { useJobsStore } from "@/stores";
 import { api } from "@/api/client";
@@ -141,7 +142,8 @@ function formatDuration(start: string | null, end: string | null): string {
  *     disable both the row button and the modal's confirm button.
  *
  * Side effects: GET /api/jobs on mount and on every filter change;
- * POST /api/jobs/{id}/cancel and DELETE /api/jobs/{id} from the modal.
+ * POST /api/jobs/{id}/cancel and DELETE /api/jobs/{id} from the modal, and
+ * POST /api/jobs/{id}/requeue straight from the row (no modal — it is additive).
  *
  * Props: none — routed component.
  */
@@ -214,6 +216,34 @@ export default function Jobs() {
     } finally {
       setActionLoading(null);
       setConfirmAction(null);
+    }
+  }, []);
+
+  /**
+   * Re-runs a job: POST /api/jobs/{id}/requeue, then reloads the list so the
+   * copy appears. Stays on the list rather than navigating to the new job —
+   * the common use is re-running several jobs in a row.
+   *
+   * AI Note: no confirmation modal, unlike cancel and delete. Those are
+   * destructive and irreversible; this only adds a job, and the mistake is
+   * undone by cancelling the copy. Do not route it through `confirmAction` for
+   * symmetry's sake — that would put a modal in front of the cheapest action
+   * on the page.
+   *
+   * Shares the swallow-errors + filter-losing refetch caveats documented on
+   * {@link handleCancel}. Here the filter loss is actually load-bearing: the
+   * new job is `pending`, so under a "Completed" or "Failed" filter it would
+   * not come back in a filtered refetch and the click would look like a no-op.
+   */
+  const handleRerun = useCallback(async (jobId: string) => {
+    setActionLoading(jobId);
+    try {
+      await api.requeueJob(jobId);
+      await useJobsStore.getState().fetch();
+    } catch {
+      // error handled by api client
+    } finally {
+      setActionLoading(null);
     }
   }, []);
 
@@ -339,16 +369,26 @@ export default function Jobs() {
                         </button>
                       )}
                       {(job.status === "completed" || job.status === "failed" || job.status === "cancelled") && (
-                        <button
-                          onClick={() =>
-                            setConfirmAction({ type: "delete", jobId: job.id })
-                          }
-                          disabled={actionLoading === job.id}
-                          className="rounded-md p-1.5 text-muted-foreground hover:bg-red-50 hover:text-red-600 transition-colors disabled:opacity-50"
-                          title="Delete"
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </button>
+                        <>
+                          <button
+                            onClick={() => handleRerun(job.id)}
+                            disabled={actionLoading === job.id}
+                            className="rounded-md p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground transition-colors disabled:opacity-50"
+                            title="Re-run with the same parameters"
+                          >
+                            <RotateCcw className="h-4 w-4" />
+                          </button>
+                          <button
+                            onClick={() =>
+                              setConfirmAction({ type: "delete", jobId: job.id })
+                            }
+                            disabled={actionLoading === job.id}
+                            className="rounded-md p-1.5 text-muted-foreground hover:bg-red-50 hover:text-red-600 transition-colors disabled:opacity-50"
+                            title="Delete"
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </button>
+                        </>
                       )}
                     </div>
                   </td>

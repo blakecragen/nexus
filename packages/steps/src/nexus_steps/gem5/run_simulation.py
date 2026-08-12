@@ -18,6 +18,13 @@ job context, both of which this step picks up automatically via
 ``ctx.resolve()``) and ``gem5_collect_results`` (which consumes the
 ``m5out_path`` and ``container`` this step publishes).
 
+``docker_ensure_container`` is **optional** as of the ``auto_start`` param: in
+container mode this step ensures the Docker daemon is running and the container
+is up (starting or creating it as needed) before its first ``docker exec``. A
+job whose only step is ``gem5_run_simulation`` therefore works. Keep the
+explicit ensure step when you need a non-default image, a specific mount set, or
+``recreate`` semantics — the auto path deliberately only covers the common case.
+
 The two execution modes
 -----------------------
 Direct mode: gem5 runs as a normal child of the agent; ``m5out`` is a host
@@ -34,7 +41,6 @@ distinction is the single largest source of bugs in this file; preserve it.
 from __future__ import annotations
 
 import os
-import shutil
 import signal
 import subprocess
 import tempfile
@@ -46,39 +52,14 @@ from pydantic import BaseModel, Field
 from nexus_common.models.enums import StepResult
 from nexus_common.steps.base import FlowStep, StepContext
 from nexus_common.steps.registry import register
+from nexus_steps.docker.util import docker_missing_error, ensure_container, ensure_daemon, find_docker
 
-
-def _find_docker(explicit: str | None) -> str | None:
-    """Locate the ``docker`` CLI on this node.
-
-    Args:
-        explicit: A caller-supplied path, returned as-is without validation.
-
-    Returns:
-        Path to a docker binary, or ``None`` if none was found.
-
-    AI Note: the PATH lookup alone is insufficient because agents typically run
-    as a LaunchAgent/systemd unit with a minimal PATH that omits
-    ``/usr/local/bin`` and ``/opt/homebrew/bin``; the hardcoded candidates are
-    the workaround (the last is Docker Desktop's in-bundle binary on macOS).
-
-    AI Note: duplicated verbatim in ``nexus_steps.docker.ensure_container`` and
-    ``nexus_steps.gem5.collect_results``. Keep all three in sync.
-    """
-    if explicit:
-        return explicit
-    found = shutil.which("docker")
-    if found:
-        return found
-    for cand in (
-        "/usr/local/bin/docker",
-        "/opt/homebrew/bin/docker",
-        os.path.expanduser("~/.docker/bin/docker"),
-        "/Applications/Docker.app/Contents/Resources/bin/docker",
-    ):
-        if os.path.exists(cand):
-            return cand
-    return None
+# Docker discovery is shared with ``docker_ensure_container`` and
+# ``gem5_collect_results`` (see ``nexus_steps.docker.util``).
+#
+# AI Note: keep calling the module-level alias rather than ``find_docker``
+# directly — the unit tests monkeypatch this name on this module.
+_find_docker = find_docker
 
 
 # ── Params ───────────────────────────────────────────────────────────────
@@ -124,6 +105,36 @@ class RunSimulationParams(BaseModel):
     docker: str | None = Field(
         None,
         description="Path to the docker binary (auto-detected when omitted).",
+    )
+    auto_start: bool = Field(
+        True,
+        description=(
+            "With `container`: start the Docker daemon if it isn't running, and "
+            "start (or create) the container if it isn't up, instead of failing."
+        ),
+    )
+    image: str = Field(
+        "ghcr.io/gem5/ubuntu-24.04_all-dependencies:latest",
+        description=(
+            "Image used only if `auto_start` has to CREATE a missing container. "
+            "Ignored when the container already exists."
+        ),
+    )
+    mounts: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Bind mounts used only when creating a missing container: "
+            "'HOST:CONTAINER' or bare 'HOST' (same path inside). Defaults to "
+            "mounting `working_dir` at the same path, which is what makes the "
+            "gem5 binary, config and m5out paths resolve inside the container."
+        ),
+        examples=[["/Users/me/Desktop/gem5"]],
+    )
+    daemon_wait: int = Field(
+        120,
+        description="Seconds to wait for the Docker daemon to become ready.",
+        ge=1,
+        le=3600,
     )
     timeout: int = Field(
         7200,
@@ -205,6 +216,11 @@ class RunSimulationStep(FlowStep):
         # string, or a direct unit-test call bypassing resolve_for_os()).
         binary = validated.gem5_binary or "/usr/local/bin/gem5.opt"
 
+        # Trail of any daemon/container preparation, surfaced as "_log" so the
+        # operator can see whether Docker or the container had to be started.
+        # Stays empty in direct mode.
+        setup_log: list[str] = []
+
         if validated.container:
             # Run inside a Docker container. All gem5 paths (binary, config,
             # working_dir, m5out) are CONTAINER paths — they may not exist on the
@@ -212,12 +228,48 @@ class RunSimulationStep(FlowStep):
             # no cwd=). `docker exec -w` sets the working dir inside the container.
             docker = _find_docker(validated.docker)
             if not docker:
-                return {"error": "docker binary not found on node", "exit_code": -1}
+                return {"error": docker_missing_error(), "exit_code": -1}
             if not validated.working_dir:
                 # Required because the container m5out path is derived from it;
                 # os.getcwd() would be a host path and meaningless in-container.
                 return {"error": "working_dir is required when using `container`", "exit_code": -1}
             cwd = validated.working_dir
+
+            # Make the environment usable before touching it. Ordering is
+            # load-bearing: the daemon must answer before any `docker ps`, and
+            # the container must be up before the `docker exec` below.
+            #
+            # AI Note: the daemon probe runs even when auto_start is False. It
+            # costs one `docker info` and converts the raw
+            # "Cannot connect to the Docker daemon at unix://...docker.sock"
+            # socket error — which used to reach the operator disguised as a
+            # "could not create m5out in container" failure — into a message
+            # that names the actual problem.
+            daemon_err = ensure_daemon(
+                docker, validated.auto_start, validated.daemon_wait, setup_log,
+            )
+            if daemon_err:
+                return {"error": daemon_err, "exit_code": -1,
+                        "_log": "\n".join(setup_log)}
+
+            if validated.auto_start:
+                # AI Note: a missing container is created with `cwd` bind-mounted
+                # at the SAME path inside. An unmounted gem5 container cannot
+                # resolve the binary, config script or m5out paths, so creating
+                # one without mounts would only relocate the failure to a more
+                # confusing place. Callers override via the `mounts` param.
+                result = ensure_container(
+                    docker,
+                    name=validated.container,
+                    image=validated.image,
+                    mounts=validated.mounts or [cwd],
+                    workdir=cwd,
+                    log=setup_log,
+                )
+                if result.error:
+                    return {"error": result.error, "exit_code": result.exit_code,
+                            "_log": "\n".join(setup_log)}
+
             # A unique m5out dir, relative to working_dir, created INSIDE the
             # container. Random suffix without host filesystem access.
             #
@@ -292,6 +344,7 @@ class RunSimulationStep(FlowStep):
             "stats_artifact_id": None,
             # Display-only; read by StepExecutor._capture() for the job log.
             "_command_str": " ".join(cmd),
+            "_log": "\n".join(setup_log),
         }
 
     def check(self, state: dict[str, Any]) -> StepResult:

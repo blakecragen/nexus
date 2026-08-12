@@ -35,7 +35,7 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from "vitest";
 import { render, screen, within, act, waitFor, fireEvent } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter, Routes, Route } from "react-router-dom";
+import { MemoryRouter, Routes, Route, useLocation } from "react-router-dom";
 import type { JobDetail as JobDetailType, JobInfo, StepRunInfo, ArtifactInfo } from "@/types";
 import { makeJob, makeStepRun } from "../test/test-utils";
 import { useLiveLogsStore, handleWsMessage } from "@/stores";
@@ -52,6 +52,7 @@ const h = vi.hoisted(() => ({
   getJobResultsManifest: vi.fn(),
   downloadJobResults: vi.fn(),
   cancelJob: vi.fn(),
+  requeueJob: vi.fn(),
 }));
 
 vi.mock("@/api/client", () => ({
@@ -62,6 +63,7 @@ vi.mock("@/api/client", () => ({
     getJobResultsManifest: h.getJobResultsManifest,
     downloadJobResults: h.downloadJobResults,
     cancelJob: h.cancelJob,
+    requeueJob: h.requeueJob,
   },
   setToken: vi.fn(),
   getToken: vi.fn(() => null),
@@ -73,6 +75,10 @@ import JobDetail from "./JobDetail";
 
 /** A fixed job id, so log keys (`${jobId}:${stepIndex}`) are easy to construct. */
 const JOB_ID = "00000000-0000-0000-0000-0000000000ff";
+
+/** The id `api.requeueJob` resolves with — deliberately != JOB_ID, because a
+ *  requeue creates an independent job and the page must navigate to the copy. */
+const NEW_JOB_ID = "00000000-0000-0000-0000-0000000000aa";
 
 /**
  * Build a `GET /api/jobs/{id}` payload.
@@ -135,6 +141,8 @@ beforeEach(() => {
   h.getJobResultsManifest.mockReset().mockResolvedValue(manifestFixture);
   h.downloadJobResults.mockReset().mockResolvedValue(undefined);
   h.cancelJob.mockReset().mockResolvedValue(makeJob({ id: JOB_ID, status: "cancelled" }));
+  // Requeue resolves with the NEW job, which is a different id by definition.
+  h.requeueJob.mockReset().mockResolvedValue(makeJob({ id: NEW_JOB_ID, status: "pending" }));
   // The live-log buffer is a module singleton; start every test with it empty.
   useLiveLogsStore.setState({ logs: {} });
 });
@@ -146,14 +154,32 @@ afterEach(() => {
 // ── Harness ─────────────────────────────────────────────────────────────────
 
 /**
+ * Stand-in for the Job Builder route, used by the Duplicate tests.
+ *
+ * Serialises `location.state` into a testid so the handoff can be asserted
+ * exactly — the prefill is the entire contract between the two pages and never
+ * touches the network, so there is nothing else to observe it by.
+ *
+ * AI Note: react-router ranks the static `/jobs/new` above the dynamic
+ * `/jobs/:id`, so this probe wins rather than JobDetail rendering with
+ * `id === "new"`.
+ */
+function BuilderProbe() {
+  const { state } = useLocation();
+  return <div data-testid="builder-probe">{JSON.stringify(state)}</div>;
+}
+
+/**
  * Render the page behind a `/jobs/:id` route (so `useParams` resolves) with a
- * sibling `/jobs` probe, which is where the back arrow navigates to.
+ * sibling `/jobs` probe, which is where the back arrow navigates to, and a
+ * `/jobs/new` probe for Duplicate.
  */
 function renderDetail(jobId: string = JOB_ID) {
   const user = userEvent.setup();
   const view = render(
     <MemoryRouter initialEntries={[`/jobs/${jobId}`]}>
       <Routes>
+        <Route path="/jobs/new" element={<BuilderProbe />} />
         <Route path="/jobs/:id" element={<JobDetail />} />
         <Route path="/jobs" element={<div data-testid="jobs-list-probe">jobs list</div>} />
       </Routes>
@@ -932,6 +958,177 @@ describe("JobDetail — cancelling a job", () => {
     expect(screen.getByText("running")).toBeInTheDocument();
     // The refetch is skipped when the cancel POST itself failed.
     expect(h.getJob).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── Re-run and Duplicate ────────────────────────────────────────────────────
+
+/**
+ * The two ways to run a job again, both offered only once the job is finished.
+ *
+ *  - Re-run    — POST /api/jobs/{id}/requeue, no body, then navigate to the copy.
+ *  - Duplicate — pure client-side handoff of `steps_config` to the Job Builder
+ *                via router state; no request at all, nothing created.
+ */
+describe("JobDetail — re-running a job", () => {
+  /** A finished job carrying a two-step plan, which is what Duplicate hands over. */
+  const planned = (steps_config = [
+    { step: "shell_run", params: { command: "make build" } },
+    { step: "gem5_run_simulation", params: { config: "se.py" } },
+  ]) => ({ ...completedDetail(), steps_config });
+
+  /**
+   * Re-run and Cancel are mutually exclusive branches of the same header slot.
+   * Regression guarded: offering Re-run mid-flight, which starts a second copy
+   * of work already running.
+   */
+  it("hides Re-run and Duplicate while the job is still running", async () => {
+    h.getJob.mockResolvedValue({ ...makeDetail(), steps_config: [{ step: "shell_run", params: {} }] });
+
+    await renderLoaded();
+
+    expect(screen.queryByRole("button", { name: /re-run/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /duplicate/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /cancel job/i })).toBeInTheDocument();
+  });
+
+  it("offers Re-run and Duplicate once the job is finished", async () => {
+    h.getJob.mockResolvedValue(planned());
+
+    await renderLoaded();
+
+    expect(screen.getByRole("button", { name: /re-run/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /duplicate/i })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /cancel job/i })).not.toBeInTheDocument();
+  });
+
+  /** Failed jobs are the main reason this feature exists. */
+  it("offers Re-run on a failed job", async () => {
+    h.getJob.mockResolvedValue({
+      ...planned(),
+      job: makeJob({ id: JOB_ID, name: "nightly-build", status: "failed" }),
+    });
+
+    await renderLoaded();
+
+    expect(screen.getByRole("button", { name: /re-run/i })).toBeInTheDocument();
+  });
+
+  /**
+   * Re-run POSTs with no body and then navigates to the *new* id.
+   *
+   * Regression guarded: refetching the current job instead of navigating. The
+   * original is deliberately left untouched, so that would render an identical
+   * page and read as a button that does nothing.
+   */
+  it("requeues the job and navigates to the copy", async () => {
+    h.getJob.mockResolvedValue(planned());
+    const { user } = await renderLoaded();
+
+    await user.click(screen.getByRole("button", { name: /re-run/i }));
+
+    expect(h.requeueJob).toHaveBeenCalledWith(JOB_ID);
+    // The route changed to the new job, so the page refetches under that id.
+    await waitFor(() => expect(h.getJob).toHaveBeenCalledWith(NEW_JOB_ID));
+  });
+
+  /** The button is disabled (with a spinner) while the POST is in flight. */
+  it("disables Re-run and shows a spinner while requeuing", async () => {
+    h.getJob.mockResolvedValue(planned());
+    const gate = deferred<JobInfo>();
+    h.requeueJob.mockReturnValue(gate.promise);
+    const { user } = await renderLoaded();
+
+    await user.click(screen.getByRole("button", { name: /re-run/i }));
+
+    const button = screen.getByRole("button", { name: /re-run/i });
+    expect(button).toBeDisabled();
+    expect(button.querySelector("svg.animate-spin")).not.toBeNull();
+
+    await act(async () => {
+      gate.resolve(makeJob({ id: NEW_JOB_ID, status: "pending" }));
+      await gate.promise;
+    });
+  });
+
+  /**
+   * A stored plan that no longer validates comes back as a 400. The page must
+   * stay put and stay usable rather than navigating to a job that was never
+   * created.
+   */
+  it("stays on the page and re-enables Re-run when the requeue fails", async () => {
+    h.getJob.mockResolvedValue(planned());
+    h.requeueJob.mockRejectedValue(new Error("unknown step 'gem5_run'"));
+    const { user } = await renderLoaded();
+
+    await user.click(screen.getByRole("button", { name: /re-run/i }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /re-run/i })).toBeEnabled()
+    );
+    expect(h.getJob).not.toHaveBeenCalledWith(NEW_JOB_ID);
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("nightly-build");
+  });
+
+  /**
+   * Duplicate is a pure navigation: the whole plan plus targeting rides on
+   * router state, and nothing is created until the builder is submitted.
+   *
+   * Regression guarded: sending the *execution records* (`steps`) instead of
+   * the plan (`steps_config`). They are different shapes and different lengths
+   * — a looping job has several `steps` entries at one index — so that mistake
+   * silently produces a wrong pipeline rather than an error.
+   */
+  it("hands the stored plan to the Job Builder as router state", async () => {
+    const detail = planned();
+    detail.job = makeJob({
+      id: JOB_ID,
+      name: "nightly-build",
+      status: "completed",
+      target_pool_id: "11111111-1111-1111-1111-111111111111",
+      target_node_id: null,
+      priority: 10,
+    });
+    h.getJob.mockResolvedValue(detail);
+    const { user } = await renderLoaded();
+
+    await user.click(screen.getByRole("button", { name: /duplicate/i }));
+
+    const probe = await screen.findByTestId("builder-probe");
+    expect(JSON.parse(probe.textContent!)).toEqual({
+      prefill: {
+        name: "nightly-build",
+        steps: detail.steps_config,
+        target_pool_id: "11111111-1111-1111-1111-111111111111",
+        target_node_id: null,
+        priority: 10,
+      },
+    });
+    // Purely client-side — no request was made.
+    expect(h.requeueJob).not.toHaveBeenCalled();
+  });
+
+  /**
+   * `steps_config` is absent on an older server and `[]` when the stored plan
+   * no longer parses (the detail endpoint degrades rather than 500ing, so the
+   * log stays readable). Both mean "duplication unavailable" — but the job is
+   * still re-runnable, because the server re-reads the plan itself.
+   */
+  it("hides Duplicate when the plan is unavailable but keeps Re-run", async () => {
+    h.getJob.mockResolvedValue(completedDetail()); // no steps_config at all
+
+    await renderLoaded();
+
+    expect(screen.queryByRole("button", { name: /duplicate/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /re-run/i })).toBeInTheDocument();
+  });
+
+  it("hides Duplicate when the stored plan came back empty", async () => {
+    h.getJob.mockResolvedValue({ ...completedDetail(), steps_config: [] });
+
+    await renderLoaded();
+
+    expect(screen.queryByRole("button", { name: /duplicate/i })).not.toBeInTheDocument();
   });
 });
 

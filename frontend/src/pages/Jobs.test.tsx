@@ -5,14 +5,16 @@
  * that re-fetches with params, shows an empty/loading state, derives a status
  * badge per row, formats priority/step/duration columns, navigates to the job
  * detail route on row click, and exposes cancel/delete actions (guarded by a
- * confirmation dialog) that call the api client. We mock only the data
+ * confirmation dialog) that call the api client, plus a re-run action on
+ * terminal rows that deliberately has no dialog. We mock only the data
  * boundaries (the store + the api client) and assert real rendered output and
  * real side effects with resilient role/text selectors.
  *
  * Neighbouring pieces: `useJobsStore` lives in src/stores (covered by
- * stores/index.test.ts), `api.cancelJob`/`api.deleteJob` hit
- * /api/jobs/{id}/cancel and /api/jobs/{id} on the server, and row clicks hand
- * off to the JobDetail route (stubbed here by `DetailProbe`).
+ * stores/index.test.ts), `api.cancelJob`/`api.deleteJob`/`api.requeueJob` hit
+ * /api/jobs/{id}/cancel, /api/jobs/{id} and /api/jobs/{id}/requeue on the
+ * server, and row clicks hand off to the JobDetail route (stubbed here by
+ * `DetailProbe`).
  */
 import { vi, describe, it, expect, beforeEach } from "vitest";
 import {
@@ -64,10 +66,13 @@ vi.mock("@/stores", () => {
 /** Spies standing in for the destructive REST calls; nothing reaches the network. */
 const cancelJobMock = vi.fn().mockResolvedValue(undefined);
 const deleteJobMock = vi.fn().mockResolvedValue(undefined);
+/** Re-run is additive, not destructive — it resolves with the NEW job. */
+const requeueJobMock = vi.fn().mockResolvedValue({ id: "new-job-id" });
 vi.mock("@/api/client", () => ({
   api: {
     cancelJob: (...args: unknown[]) => cancelJobMock(...args),
     deleteJob: (...args: unknown[]) => deleteJobMock(...args),
+    requeueJob: (...args: unknown[]) => requeueJobMock(...args),
   },
 }));
 
@@ -77,6 +82,8 @@ beforeEach(() => {
   fetchMock.mockClear();
   cancelJobMock.mockClear();
   deleteJobMock.mockClear();
+  requeueJobMock.mockClear();
+  requeueJobMock.mockResolvedValue({ id: "new-job-id" });
   // Re-arm the resolved values: individual tests use mockRejectedValueOnce, and
   // mockClear() does not restore an implementation replaced by a *Once variant
   // that never got consumed.
@@ -478,6 +485,129 @@ describe("Jobs page", () => {
     await waitFor(() =>
       expect(screen.queryByText("Delete Job?")).not.toBeInTheDocument()
     );
+  });
+
+  // ── Re-run flow (no dialog — the action is additive) ──────────────────────
+  /**
+   * Re-run belongs to the same terminal-row bucket as Delete. Regression
+   * guarded: offering it on a running job, which would silently start a second
+   * concurrent copy of work already in flight.
+   */
+  it("shows Re-run on terminal rows and not on in-flight ones", () => {
+    storeState.jobs = [
+      makeJob({ name: "done-job", status: "completed" }),
+      makeJob({ name: "live-job", status: "running" }),
+    ];
+    renderWithRouter(<Jobs />);
+
+    const done = screen.getByText("done-job").closest("tr")!;
+    const live = screen.getByText("live-job").closest("tr")!;
+    expect(
+      within(done).getByTitle("Re-run with the same parameters")
+    ).toBeInTheDocument();
+    expect(
+      within(live).queryByTitle("Re-run with the same parameters")
+    ).not.toBeInTheDocument();
+  });
+
+  /**
+   * The whole point of the row button: one click, no confirmation, then a
+   * refetch so the new pending job shows up.
+   *
+   * Regression guarded (two ways): a dialog creeping in to match cancel/delete
+   * — this action is trivially undone by cancelling the copy, so a modal would
+   * be pure friction; and a missing refetch, which leaves the list looking
+   * exactly as it did before and reads as a dead button.
+   */
+  it("re-runs a job with no confirmation dialog and refetches the list", async () => {
+    const job = makeJob({ name: "rerun-flow", status: "failed" });
+    storeState.jobs = [job];
+    const { user } = renderWithRouter(<Jobs />);
+
+    fetchMock.mockClear(); // ignore the mount fetch
+
+    await user.click(screen.getByTitle("Re-run with the same parameters"));
+
+    await waitFor(() => expect(requeueJobMock).toHaveBeenCalledWith(job.id));
+    expect(fetchMock).toHaveBeenCalled();
+    // No modal was ever shown, and nothing destructive fired.
+    expect(screen.queryByText("Delete Job?")).not.toBeInTheDocument();
+    expect(screen.queryByText("Cancel Job?")).not.toBeInTheDocument();
+    expect(deleteJobMock).not.toHaveBeenCalled();
+    expect(cancelJobMock).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The refetch is intentionally unfiltered (`getState().fetch()` with no
+   * params). Regression guarded: passing the active filter through would hide
+   * the freshly created `pending` job whenever the user is looking at, say,
+   * "Failed" — the copy exists but never appears.
+   */
+  it("refetches without the active status filter after a re-run", async () => {
+    storeState.jobs = [makeJob({ name: "rerun-filter", status: "failed" })];
+    const { user } = renderWithRouter(<Jobs />);
+
+    fetchMock.mockClear();
+    await user.click(screen.getByTitle("Re-run with the same parameters"));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    expect(fetchMock).toHaveBeenCalledWith();
+  });
+
+  /**
+   * Re-run stays on the list rather than following the copy. Regression
+   * guarded: a `navigate` to the new job would break re-running several jobs in
+   * a row, which is the common case after a node or daemon outage.
+   */
+  it("stays on the jobs list after a re-run", async () => {
+    storeState.jobs = [makeJob({ name: "rerun-stay", status: "cancelled" })];
+    const { user } = renderWithRouter(<Jobs />);
+
+    await user.click(screen.getByTitle("Re-run with the same parameters"));
+
+    await waitFor(() => expect(requeueJobMock).toHaveBeenCalled());
+    expect(screen.getByText("rerun-stay")).toBeInTheDocument();
+    expect(screen.queryByTestId("detail-probe")).not.toBeInTheDocument();
+  });
+
+  /**
+   * A rejected requeue must clear `actionLoading` in its `finally`, or the
+   * row's buttons stay disabled until a full reload.
+   */
+  it("re-enables the row's actions when the re-run rejects", async () => {
+    requeueJobMock.mockRejectedValueOnce(new Error("plan no longer valid"));
+    storeState.jobs = [makeJob({ name: "rerun-fail", status: "failed" })];
+    const { user } = renderWithRouter(<Jobs />);
+
+    const button = screen.getByTitle("Re-run with the same parameters");
+    await user.click(button);
+
+    await waitFor(() => expect(requeueJobMock).toHaveBeenCalled());
+    await waitFor(() => expect(button).not.toBeDisabled());
+  });
+
+  /**
+   * The Actions cell sits inside a row whose own click navigates to the detail
+   * page. Regression guarded: dropping the `stopPropagation` wrapper, which
+   * would re-run the job AND yank the user off the list mid-action.
+   */
+  it("does not navigate to the detail page when Re-run is clicked", async () => {
+    storeState.jobs = [makeJob({ name: "rerun-nonav", status: "completed" })];
+
+    const user = userEvent.setup();
+    render(
+      <MemoryRouter initialEntries={["/jobs"]}>
+        <Routes>
+          <Route path="/jobs" element={<Jobs />} />
+          <Route path="/jobs/:id" element={<DetailProbe />} />
+        </Routes>
+      </MemoryRouter>
+    );
+
+    await user.click(screen.getByTitle("Re-run with the same parameters"));
+
+    await waitFor(() => expect(requeueJobMock).toHaveBeenCalled());
+    expect(screen.queryByTestId("detail-probe")).not.toBeInTheDocument();
   });
 });
 

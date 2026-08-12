@@ -391,6 +391,19 @@ export const api = {
       method: "POST",
       body: JSON.stringify(data),
     }),
+  /**
+   * POST /api/jobs/{id}/requeue — re-submit this job's plan as a brand new job.
+   *
+   * Takes no body: name, steps, pool/node pin, priority and storage target are
+   * all copied verbatim server-side. Returns the NEW job (a different id) —
+   * never the original, which is left untouched.
+   *
+   * Rejects with 400 if the stored plan no longer validates against the current
+   * step registry (a step type since renamed or removed), which is the same
+   * error shape POST /api/jobs produces.
+   */
+  requeueJob: (id: string) =>
+    request<import("@/types").JobInfo>(`/jobs/${id}/requeue`, { method: "POST" }),
   /** POST /api/jobs/{id}/cancel — request cancellation; returns the updated job. Only meaningful for pending/queued/running jobs. */
   cancelJob: (id: string) =>
     request<import("@/types").JobInfo>(`/jobs/${id}/cancel`, { method: "POST" }),

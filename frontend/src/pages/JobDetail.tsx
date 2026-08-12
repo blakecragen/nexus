@@ -14,6 +14,9 @@
  *   - GET /api/jobs/{id}/results/manifest   -> the Results file tree
  *   - GET /api/jobs/{id}/results/download   -> authenticated tarball download
  *   - POST /api/jobs/{id}/cancel            -> Cancel Job button
+ *   - POST /api/jobs/{id}/requeue           -> Re-run button (creates a copy)
+ *   The Duplicate button hits no endpoint: it hands `steps_config` from the
+ *   detail payload to the Job Builder as router state.
  *   - `useLiveLogsStore` supplies the per-step live log lines, which are
  *     pushed in by `handleWsMessage` from the `/ws/dashboard` socket that
  *     `<Layout />` owns (message type `step.log`).
@@ -46,6 +49,8 @@ import {
   FileBarChart,
   File as FileIcon,
   Package,
+  RotateCcw,
+  Copy,
 } from "lucide-react";
 import { api } from "@/api/client";
 import { useLiveLogsStore } from "@/stores";
@@ -491,6 +496,7 @@ export default function JobDetail() {
   const [selectedStep, setSelectedStep] = useState<number>(0);
   const [activeTab, setActiveTab] = useState<DetailTab>("logs");
   const [cancelling, setCancelling] = useState(false);
+  const [rerunning, setRerunning] = useState(false);
   const [fullLog, setFullLog] = useState<string>("");
   const [resultsManifest, setResultsManifest] = useState<
     { archive_bytes: number; entries: { path: string; size: number; is_dir: boolean }[] } | null
@@ -659,6 +665,61 @@ export default function JobDetail() {
     }
   }, [id]);
 
+  /**
+   * Re-runs the job: POST /api/jobs/{id}/requeue, then navigates to the copy.
+   *
+   * The endpoint takes no body — name, plan, pool/node pin, priority and
+   * storage target are all copied server-side from the stored `steps_config`,
+   * so this is faithful in a way the Duplicate path is not (see below).
+   *
+   * AI Note: navigating to the *new* id remounts this page against a different
+   * job, which is what re-keys the poll and the live-log subscription. Do not
+   * "optimise" this into a refetch of the current id — the original is
+   * deliberately left untouched, so a refetch would show no change at all and
+   * look like the button did nothing.
+   */
+  const handleRerun = useCallback(async () => {
+    if (!id) return;
+    setRerunning(true);
+    try {
+      const newJob = await api.requeueJob(id);
+      navigate(`/jobs/${newJob.id}`);
+    } catch {
+      // surfaced by api client
+    } finally {
+      setRerunning(false);
+    }
+  }, [id, navigate]);
+
+  /**
+   * Opens the Job Builder pre-filled with this job's plan, to edit before
+   * submitting. Nothing is created until the user submits there.
+   *
+   * The prefill rides on router state rather than the URL: the plan is
+   * unbounded JSON and has no business in a query string. Consequence, and it
+   * is intentional: a browser reload of `/jobs/new` drops the state and yields
+   * an empty builder.
+   *
+   * AI Note: `priority` round-trips through the builder's three-label selector
+   * (high/normal/low = 10/5/1), so an off-scale integer set via the API is
+   * snapped to the nearest label. The one-click Re-run path above has no such
+   * loss because the copy happens server-side.
+   */
+  const handleDuplicate = useCallback(() => {
+    if (!detail) return;
+    navigate("/jobs/new", {
+      state: {
+        prefill: {
+          name: detail.job.name,
+          steps: detail.steps_config ?? [],
+          target_pool_id: detail.job.target_pool_id,
+          target_node_id: detail.job.target_node_id,
+          priority: detail.job.priority,
+        },
+      },
+    });
+  }, [detail, navigate]);
+
   if (isLoading || !detail) {
     return (
       <div className="flex items-center justify-center py-24">
@@ -719,7 +780,12 @@ export default function JobDetail() {
             )}
           </div>
         </div>
-        {isActive && (
+        {/* Cancel while the job is live; Re-run / Duplicate once it is not.
+            The two branches are mutually exclusive by design — re-running a job
+            that is still going produces two concurrent copies of the same work,
+            which is almost never what the click meant. The server does allow it
+            (POST /requeue has no status check); this is purely the UI's call. */}
+        {isActive ? (
           <button
             onClick={handleCancel}
             disabled={cancelling}
@@ -728,6 +794,36 @@ export default function JobDetail() {
             {cancelling && <Loader2 className="h-4 w-4 animate-spin" />}
             Cancel Job
           </button>
+        ) : (
+          <div className="flex items-center gap-2">
+            <button
+              onClick={handleRerun}
+              disabled={rerunning}
+              title="Submit an identical copy of this job"
+              className="inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50"
+            >
+              {rerunning ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <RotateCcw className="h-4 w-4" />
+              )}
+              Re-run
+            </button>
+            {/* Hidden when the plan is unavailable: an older server omits
+                `steps_config` entirely, and the detail endpoint returns `[]`
+                when the stored plan no longer parses. Opening an empty builder
+                titled with this job's name would be worse than no button. */}
+            {detail.steps_config && detail.steps_config.length > 0 && (
+              <button
+                onClick={handleDuplicate}
+                title="Open the Job Builder pre-filled with this job's steps"
+                className="inline-flex items-center gap-2 rounded-lg border border-border px-4 py-2 text-sm font-medium hover:bg-muted transition-colors"
+              >
+                <Copy className="h-4 w-4" />
+                Duplicate
+              </button>
+            )}
+          </div>
         )}
       </div>
 

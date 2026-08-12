@@ -15,6 +15,10 @@
  *   - `useNodesStore`  -> GET /api/nodes  (target dropdown, online only)
  *   - `api.submitJob`  -> POST /api/jobs, then navigates to
  *     `JobDetail.tsx` at `/jobs/{id}`.
+ *   - Router state `{ prefill }` (set by "Duplicate" on `JobDetail.tsx`) seeds
+ *     the whole form from an existing job's plan. Nothing is fetched for it and
+ *     nothing is created until the user submits — see {@link JobBuilder}'s
+ *     prefill effect.
  *
  * AI Note: the parameter form is entirely schema-driven — the frontend hard-codes
  * no knowledge of any specific step. Adding a step type on the server makes it
@@ -33,7 +37,7 @@
  * canvas.
  */
 import { useState, useEffect, useMemo, useCallback } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useLocation } from "react-router-dom";
 import {
   DndContext,
   DragOverlay,
@@ -65,7 +69,7 @@ import {
 import { cn } from "@/lib/utils";
 import { api } from "@/api/client";
 import { useStepsStore, usePoolsStore, useNodesStore } from "@/stores";
-import type { StepSchemaInfo, FieldSchema } from "@/types";
+import type { StepSchemaInfo, FieldSchema, StepConfig } from "@/types";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -79,11 +83,23 @@ import type { StepSchemaInfo, FieldSchema } from "@/types";
  * `StepRun.id` that comes back on the job detail page. `step` is the schema
  * name; `params` is the raw form state (which can contain empty strings that
  * are stripped at submit time).
+ *
+ * AI Note: `on_fail` and the three `target_*` fields have NO UI here — nothing
+ * in this page ever sets them. They exist purely so a plan arriving via the
+ * Duplicate prefill can be carried back out unchanged at submit time. Without
+ * them, duplicating a job authored in a `.nexus` file (the only producer of
+ * per-step targets and `on_fail: "continue"`) would silently rewrite every step
+ * to stop-on-failure on the job-wide target. If you add UI for them, they stop
+ * being pass-through and this note should go.
  */
 interface BuilderStep {
   id: string;
   step: string;
   params: Record<string, unknown>;
+  on_fail?: StepConfig["on_fail"];
+  target_node_id?: StepConfig["target_node_id"];
+  target_pool_id?: StepConfig["target_pool_id"];
+  target_os?: StepConfig["target_os"];
 }
 
 /** Whether the job targets a whole pool or one specific node. */
@@ -103,6 +119,47 @@ const PRIORITY_VALUES: Record<Priority, number> = {
   normal: 5,
   low: 1,
 };
+
+/**
+ * Inverse of {@link PRIORITY_VALUES}: snaps an arbitrary integer to the closest
+ * of the three labels, so a duplicated job lands on a selector that has only
+ * three positions.
+ *
+ * AI Note: this is lossy, and deliberately so. A job submitted through the API
+ * with `priority: 3` comes back as "low" (=1), and re-submitting from the
+ * builder writes 1. That is confined to the edit-before-submit flow — the
+ * one-click Re-run path copies the integer verbatim server-side and never
+ * passes through here. Ties break toward the lower priority ("normal" for 7.5),
+ * which is the safer direction for a queue ordered highest-first.
+ */
+function priorityLabel(value: number): Priority {
+  let best: Priority = "normal";
+  let bestDist = Infinity;
+  for (const label of ["low", "normal", "high"] as Priority[]) {
+    const dist = Math.abs(PRIORITY_VALUES[label] - value);
+    if (dist < bestDist) {
+      best = label;
+      bestDist = dist;
+    }
+  }
+  return best;
+}
+
+/**
+ * Shape of the `location.state.prefill` payload that `JobDetail.tsx`'s
+ * "Duplicate" button hands over.
+ *
+ * AI Note: this crosses a router boundary, so it is untyped at runtime — a
+ * stale tab or a hand-written `navigate` call can deliver anything. The prefill
+ * effect validates defensively rather than trusting this declaration.
+ */
+interface JobPrefill {
+  name?: string;
+  steps?: StepConfig[];
+  target_pool_id?: string | null;
+  target_node_id?: string | null;
+  priority?: number;
+}
 
 // ---------------------------------------------------------------------------
 // Category helpers
@@ -736,6 +793,66 @@ export default function JobBuilder() {
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
 
+  // Prefill from "Duplicate" on the job detail page.
+  //
+  // Runs once per navigation (keyed on `location.state`) and seeds the whole
+  // form from the original job's stored plan. From here the builder behaves
+  // exactly as if the user had assembled it by hand — nothing is created until
+  // Submit, and every field stays editable.
+  //
+  // AI Note: this does NOT wait for `stepsStore` to load. Steps are seeded
+  // straight from the plan, and their schemas are resolved lazily by
+  // `schemaMap` when the canvas renders. That is what makes a step type the
+  // server no longer advertises degrade to the existing placeholder card
+  // instead of being silently dropped from the pipeline — the plan stays
+  // visible and the user can see what to fix.
+  //
+  // AI Note: params are shallow-copied out of router state, so editing a
+  // duplicated step cannot write back into the history entry (which would make
+  // a browser Back-then-Forward show the edits). Shallow is enough because
+  // `updateStepParams` replaces the params object wholesale rather than
+  // mutating it; a nested-object param would need a deep copy.
+  //
+  // AI Note: a browser reload of /jobs/new drops router state entirely and
+  // yields an empty builder. Known and accepted — the plan is unbounded JSON
+  // and does not belong in a query string. Do not "fix" it by stashing the
+  // prefill in localStorage; a stale plan resurfacing on an unrelated visit is
+  // worse than an empty form.
+  const location = useLocation();
+  const prefill = (location.state as { prefill?: JobPrefill } | null)?.prefill;
+  useEffect(() => {
+    if (!prefill) return;
+    if (prefill.name) setJobName(prefill.name);
+    if (Array.isArray(prefill.steps)) {
+      const seeded = prefill.steps.map((s) => ({
+        id: uniqueId(),
+        step: s.step,
+        params: { ...(s.params ?? {}) },
+        on_fail: s.on_fail,
+        target_node_id: s.target_node_id,
+        target_pool_id: s.target_pool_id,
+        target_os: s.target_os,
+      }));
+      setBuilderSteps(seeded);
+      // Land in the first step's parameter form — the point of Duplicate is to
+      // change something, so an empty right-hand panel would just be one extra
+      // click.
+      setSelectedId(seeded[0]?.id ?? null);
+    }
+    // Node pin wins when both are set: it is the more specific target, and the
+    // server ignores `target_pool_id` for a node-pinned job anyway.
+    if (prefill.target_node_id) {
+      setTargetMode("node");
+      setTargetNodeId(prefill.target_node_id);
+    } else if (prefill.target_pool_id) {
+      setTargetMode("pool");
+      setTargetPoolId(prefill.target_pool_id);
+    }
+    if (typeof prefill.priority === "number") {
+      setPriority(priorityLabel(prefill.priority));
+    }
+  }, [prefill]);
+
   // Current selected step
   // `selectedSchema` may be undefined if the server stopped advertising this
   // step type; the right-hand panel then falls back to its placeholder.
@@ -857,8 +974,9 @@ export default function JobBuilder() {
    * Validates locally, serialises the canvas into the API payload, POSTs
    * /api/jobs and navigates to the created job.
    *
-   * Payload shape: `{ name, steps: [{ step, params }], target_pool_id?,
-   * target_node_id?, priority }`.
+   * Payload shape: `{ name, steps: [{ step, params, on_fail?, target_* }],
+   * target_pool_id?, target_node_id?, priority }`. The per-step fields only
+   * appear on a plan that arrived via the Duplicate prefill.
    *
    * AI Note: params are filtered before sending — `""`, null and undefined are
    * dropped so the server sees "field absent" (and applies its own default)
@@ -895,6 +1013,13 @@ export default function JobBuilder() {
           ([, v]) => v !== "" && v !== null && v !== undefined
         )
       ),
+      // Pass-through only — set by a Duplicate prefill, never by this UI. Each
+      // is omitted unless present so the server applies its own defaults
+      // ("stop", no per-step target) exactly as it does for a hand-built job.
+      ...(bs.on_fail ? { on_fail: bs.on_fail } : {}),
+      ...(bs.target_node_id ? { target_node_id: bs.target_node_id } : {}),
+      ...(bs.target_pool_id ? { target_pool_id: bs.target_pool_id } : {}),
+      ...(bs.target_os ? { target_os: bs.target_os } : {}),
     }));
 
     setSubmitting(true);

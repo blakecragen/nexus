@@ -55,12 +55,15 @@ from nexus_steps.git.clone import GitCloneParams, GitCloneStep
 from nexus_steps.git import pull as pull_mod
 from nexus_steps.git.pull import GitPullParams, GitPullStep
 from nexus_steps.docker import ensure_container as ensure_mod
+from nexus_steps.docker import util as docker_util
 from nexus_steps.docker.ensure_container import (
     EnsureContainerParams,
     EnsureContainerStep,
     _find_docker,
 )
+from nexus_steps.gem5 import run_simulation as run_sim_mod
 from nexus_steps.gem5.run_simulation import RunSimulationParams, RunSimulationStep
+from nexus_steps.gem5 import collect_results as collect_mod
 from nexus_steps.gem5.collect_results import CollectResultsParams, CollectResultsStep
 from nexus_steps.system import update_software as update_software_mod
 from nexus_steps.system.update_software import UpdateSoftwareParams, UpdateSoftwareStep
@@ -82,6 +85,47 @@ class _FakeCompleted:
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
+
+
+# The real implementations, captured at import time — before the autouse
+# fixture below swaps the module attributes out. Tests that exercise these two
+# functions themselves must call these names, since reading
+# ``docker_util.daemon_ready`` inside a test would hand back the stub.
+_REAL_DAEMON_READY = docker_util.daemon_ready
+_REAL_START_COMMANDS = docker_util._start_commands
+
+
+@pytest.fixture(autouse=True)
+def stub_docker_daemon(monkeypatch):
+    """Report the Docker daemon as up, and make starting one impossible.
+
+    Every docker-touching step now calls ``ensure_daemon()`` before its first
+    real docker command. That probe lives in ``docker_util``, NOT in the step
+    module, so a test that stubs ``<step_mod>.subprocess.run`` does not
+    intercept it — the probe would shell out for real, find no daemon, and (on
+    macOS) actually launch Docker Desktop and then block for the full
+    ``daemon_wait``. Autouse, because the cost of forgetting it on one test is a
+    two-minute stall plus a real application launch.
+
+    ``_start_commands`` is emptied as a second line of defence: even if a test
+    deliberately reports the daemon as down, no start command can escape into
+    the developer's machine.
+
+    Tests that exercise daemon behaviour re-patch these names themselves;
+    monkeypatch applies in order, so a later setattr wins.
+    """
+    monkeypatch.setattr(docker_util, "daemon_ready", lambda *a, **k: True)
+    monkeypatch.setattr(docker_util, "_start_commands", lambda *a, **k: [])
+
+
+@pytest.fixture
+def no_sleep(monkeypatch):
+    """Make the daemon readiness poll spin without real delay.
+
+    ``start_daemon`` sleeps ``_POLL_INTERVAL`` between probes; the wait-expiry
+    tests below would otherwise take their full budget in wall-clock seconds.
+    """
+    monkeypatch.setattr(docker_util.time, "sleep", lambda _s: None)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1142,7 +1186,7 @@ def test_find_docker_explicit_path_wins():
 
 def test_find_docker_uses_shutil_which(monkeypatch):
     """With no explicit path, PATH is searched via shutil.which."""
-    monkeypatch.setattr(ensure_mod.shutil, "which", lambda name: "/usr/bin/docker")
+    monkeypatch.setattr(docker_util.shutil, "which", lambda name: "/usr/bin/docker")
     assert _find_docker(None) == "/usr/bin/docker"
 
 
@@ -1153,10 +1197,10 @@ def test_find_docker_falls_back_to_candidates(monkeypatch):
     /opt/homebrew/bin, so the hardcoded candidate list is what makes Docker work on
     a stock macOS node.
     """
-    monkeypatch.setattr(ensure_mod.shutil, "which", lambda name: None)
+    monkeypatch.setattr(docker_util.shutil, "which", lambda name: None)
     # Only the homebrew candidate "exists".
     monkeypatch.setattr(
-        ensure_mod.os.path,
+        docker_util.os.path,
         "exists",
         lambda p: p == "/opt/homebrew/bin/docker",
     )
@@ -1165,8 +1209,8 @@ def test_find_docker_falls_back_to_candidates(monkeypatch):
 
 def test_find_docker_returns_none_when_missing(monkeypatch):
     """With nothing found, None is returned so callers can emit a clear 'not found' error."""
-    monkeypatch.setattr(ensure_mod.shutil, "which", lambda name: None)
-    monkeypatch.setattr(ensure_mod.os.path, "exists", lambda p: False)
+    monkeypatch.setattr(docker_util.shutil, "which", lambda name: None)
+    monkeypatch.setattr(docker_util.os.path, "exists", lambda p: False)
     assert _find_docker(None) is None
 
 
@@ -1232,7 +1276,7 @@ def test_ensure_container_no_docker_binary(monkeypatch):
     monkeypatch.setattr(ensure_mod, "_find_docker", lambda explicit: None)
     step = EnsureContainerStep()
     state = step.startup({"name": "c1"}, StepContext())
-    assert state["error"] == "docker binary not found on node"
+    assert state["error"] == docker_util.docker_missing_error()
     assert state["exit_code"] == -1
     assert step.check(state) is StepResult.FAILED
 
@@ -1269,7 +1313,7 @@ def test_ensure_container_creates_new_container(monkeypatch):
             return _FakeCompleted(0, stdout="containerid")
         return _FakeCompleted(0)
 
-    monkeypatch.setattr(ensure_mod.subprocess, "run", _fake_run)
+    monkeypatch.setattr(docker_util.subprocess, "run", _fake_run)
     step = EnsureContainerStep()
     state = step.startup(
         {"name": "c1", "image": "img:latest", "mounts": ["/data"]},
@@ -1300,7 +1344,7 @@ def test_ensure_container_attaches_to_running(monkeypatch):
             return _FakeCompleted(0, stdout="c1")  # already running everywhere
         return _FakeCompleted(0)
 
-    monkeypatch.setattr(ensure_mod.subprocess, "run", _fake_run)
+    monkeypatch.setattr(docker_util.subprocess, "run", _fake_run)
     step = EnsureContainerStep()
     state = step.startup({"name": "c1"}, StepContext())
     assert state["exit_code"] == 0
@@ -1332,7 +1376,7 @@ def test_ensure_container_starts_stopped_container(monkeypatch):
             return _FakeCompleted(0, stdout="c1" if started else "")
         return _FakeCompleted(0)
 
-    monkeypatch.setattr(ensure_mod.subprocess, "run", _fake_run)
+    monkeypatch.setattr(docker_util.subprocess, "run", _fake_run)
     step = EnsureContainerStep()
     state = step.startup({"name": "c1"}, StepContext())
     assert state["exit_code"] == 0
@@ -1355,7 +1399,7 @@ def test_ensure_container_start_failure(monkeypatch):
             return _FakeCompleted(1, stderr="cannot start")
         return _FakeCompleted(0)
 
-    monkeypatch.setattr(ensure_mod.subprocess, "run", _fake_run)
+    monkeypatch.setattr(docker_util.subprocess, "run", _fake_run)
     step = EnsureContainerStep()
     state = step.startup({"name": "c1"}, StepContext())
     assert "docker start failed" in state["error"]
@@ -1388,7 +1432,7 @@ def test_ensure_container_recreate_removes_then_creates(monkeypatch):
             return _FakeCompleted(0, stdout="newid")
         return _FakeCompleted(0)
 
-    monkeypatch.setattr(ensure_mod.subprocess, "run", _fake_run)
+    monkeypatch.setattr(docker_util.subprocess, "run", _fake_run)
     step = EnsureContainerStep()
     state = step.startup({"name": "c1", "recreate": True}, StepContext())
     assert state["exit_code"] == 0
@@ -1418,7 +1462,7 @@ def test_ensure_container_not_running_after_ensure(monkeypatch):
             return _FakeCompleted(0, stdout="id")
         return _FakeCompleted(0)
 
-    monkeypatch.setattr(ensure_mod.subprocess, "run", _fake_run)
+    monkeypatch.setattr(docker_util.subprocess, "run", _fake_run)
     step = EnsureContainerStep()
     state = step.startup({"name": "c1"}, StepContext())
     assert "not running after ensure" in state["error"]
@@ -1447,7 +1491,7 @@ def test_ensure_container_explicit_mount_spec_passthrough(monkeypatch):
             return _FakeCompleted(0, stdout="id")
         return _FakeCompleted(0)
 
-    monkeypatch.setattr(ensure_mod.subprocess, "run", _fake_run)
+    monkeypatch.setattr(docker_util.subprocess, "run", _fake_run)
     step = EnsureContainerStep()
     state = step.startup(
         {"name": "c1", "mounts": ["/host/path:/container/path"], "workdir": "/work"},
@@ -1474,7 +1518,7 @@ def test_ensure_container_unexpected_exception_captured(monkeypatch):
         """Raise a non-timeout exception from a docker call."""
         raise RuntimeError("kaboom")
 
-    monkeypatch.setattr(ensure_mod.subprocess, "run", _boom)
+    monkeypatch.setattr(docker_util.subprocess, "run", _boom)
     step = EnsureContainerStep()
     state = step.startup({"name": "c1"}, StepContext())
     assert "RuntimeError: kaboom" in state["error"]
@@ -1494,7 +1538,7 @@ def test_ensure_container_run_failure(monkeypatch):
             return _FakeCompleted(1, stderr="no such image")
         return _FakeCompleted(0)
 
-    monkeypatch.setattr(ensure_mod.subprocess, "run", _fake_run)
+    monkeypatch.setattr(docker_util.subprocess, "run", _fake_run)
     step = EnsureContainerStep()
     state = step.startup({"name": "c1"}, StepContext())
     assert "docker run failed" in state["error"]
@@ -1510,7 +1554,7 @@ def test_ensure_container_timeout(monkeypatch):
         """Time out on every docker invocation."""
         raise subprocess.TimeoutExpired(cmd, 60)
 
-    monkeypatch.setattr(ensure_mod.subprocess, "run", _fake_run)
+    monkeypatch.setattr(docker_util.subprocess, "run", _fake_run)
     step = EnsureContainerStep()
     state = step.startup({"name": "c1"}, StepContext())
     assert state["error"] == "docker command timed out"
@@ -1520,6 +1564,356 @@ def test_ensure_container_timeout(monkeypatch):
 def test_ensure_container_cancel_noop():
     """cancel() is safe — the docker calls run synchronously inside startup()."""
     assert EnsureContainerStep().cancel({}) is None
+
+
+def test_ensure_container_daemon_down_reported(monkeypatch):
+    """A dead daemon fails the step before any container command is issued.
+
+    This is the regression the daemon probe exists for: `_find_docker` finds
+    Docker Desktop's CLI shim whether or not the daemon behind it is alive, so
+    without this check the first `docker ps` failed with a socket error that
+    reached the operator disguised as a container problem.
+    """
+    monkeypatch.setattr(ensure_mod, "_find_docker", lambda explicit: "/bin/docker")
+    monkeypatch.setattr(docker_util, "daemon_ready", lambda *a, **k: False)
+
+    def _no_docker(cmd, **kwargs):
+        """Fail the test if any docker command runs with the daemon down."""
+        raise AssertionError(f"no docker command may run with the daemon down: {cmd}")
+
+    monkeypatch.setattr(docker_util.subprocess, "run", _no_docker)
+    step = EnsureContainerStep()
+    state = step.startup({"name": "c1", "auto_start_daemon": False}, StepContext())
+    assert "Docker daemon is not running" in state["error"]
+    assert state["exit_code"] == -1
+    assert step.check(state) is StepResult.FAILED
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# docker/util.py — daemon discovery, readiness and start
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+# ── find_docker ──
+
+
+def test_find_docker_expands_home_candidate(monkeypatch):
+    """The ~/.docker candidate is expanded before the existence check.
+
+    DOCKER_CANDIDATES stores the entry with a literal '~'; without expanduser
+    os.path.exists would always be False and Docker Desktop's per-user CLI
+    install would be invisible to a launchd agent.
+    """
+    monkeypatch.setattr(docker_util.shutil, "which", lambda name: None)
+    home_docker = os.path.expanduser("~/.docker/bin/docker")
+    monkeypatch.setattr(docker_util.os.path, "exists", lambda p: p == home_docker)
+    assert docker_util.find_docker(None) == home_docker
+    assert "~" not in docker_util.find_docker(None)
+
+
+# ── daemon_ready ──
+
+
+def test_daemon_ready_true_when_info_exits_zero(monkeypatch):
+    """`docker info` exiting 0 is the readiness signal."""
+    seen = []
+
+    def _fake_run(cmd, **kwargs):
+        """Record the probe command and report success."""
+        seen.append(cmd)
+        return _FakeCompleted(0)
+
+    monkeypatch.setattr(docker_util.subprocess, "run", _fake_run)
+    assert _REAL_DAEMON_READY("/bin/docker") is True
+    assert seen == [["/bin/docker", "info"]]
+
+
+def test_daemon_ready_false_when_info_fails(monkeypatch):
+    """A non-zero `docker info` means not ready."""
+    monkeypatch.setattr(
+        docker_util.subprocess,
+        "run",
+        lambda cmd, **kw: _FakeCompleted(1, stderr="Cannot connect to the Docker daemon"),
+    )
+    assert _REAL_DAEMON_READY("/bin/docker") is False
+
+
+def test_daemon_ready_swallows_exceptions(monkeypatch):
+    """A raising probe is 'not ready', never an exception out of the predicate.
+
+    Callers treat this as a pure predicate; a missing binary or a wedged socket
+    must not turn into a traceback halfway through a step.
+    """
+
+    def _boom(cmd, **kwargs):
+        """Raise the way a missing docker binary would."""
+        raise FileNotFoundError("/bin/docker")
+
+    monkeypatch.setattr(docker_util.subprocess, "run", _boom)
+    assert _REAL_DAEMON_READY("/bin/docker") is False
+
+
+def test_daemon_ready_probe_is_bounded(monkeypatch):
+    """The probe always passes a timeout — a wedged daemon must not hang a step."""
+    captured = {}
+
+    def _fake_run(cmd, **kwargs):
+        """Capture the kwargs the probe was invoked with."""
+        captured.update(kwargs)
+        return _FakeCompleted(0)
+
+    monkeypatch.setattr(docker_util.subprocess, "run", _fake_run)
+    _REAL_DAEMON_READY("/bin/docker", timeout=7)
+    assert captured["timeout"] == 7
+
+
+# ── _start_commands ──
+
+
+def test_start_commands_macos_prefers_desktop_cli_over_open(monkeypatch):
+    """macOS tries `docker desktop start` first, then `open -ga Docker`.
+
+    Order is load-bearing. The agent is normally a background process launched
+    over SSH or by launchd, and `open` asks the login session's LaunchServices
+    to front a GUI app — which fails outright on a headless or logged-out node,
+    exactly the state a remote compute node is usually in. The `docker desktop`
+    CLI plugin talks to Docker Desktop's own service and works there.
+
+    The `-g` on the retained fallback is also deliberate: when `open` is what
+    runs, Docker Desktop must not steal focus from the operator.
+    """
+    monkeypatch.setattr(docker_util.platform, "system", lambda: "Darwin")
+    cmds = _REAL_START_COMMANDS("/opt/homebrew/bin/docker")
+    assert cmds == [
+        ["/opt/homebrew/bin/docker", "desktop", "start"],
+        ["open", "-ga", "Docker"],
+    ]
+
+
+def test_start_commands_linux_tries_systemctl_then_passwordless_sudo(monkeypatch):
+    """Linux tries plain systemctl first, then `sudo -n` — never an interactive sudo.
+
+    Without -n, sudo prompts for a password on a terminal the agent does not
+    have and the step hangs until its timeout instead of failing usefully.
+    """
+    monkeypatch.setattr(docker_util.platform, "system", lambda: "Linux")
+    cmds = _REAL_START_COMMANDS("/usr/bin/docker")
+    assert cmds[0] == ["systemctl", "start", "docker"]
+    assert cmds[1] == ["sudo", "-n", "systemctl", "start", "docker"]
+    assert all("-n" in c for c in cmds if c[0] == "sudo")
+
+
+def test_start_commands_unknown_platform_is_empty(monkeypatch):
+    """An unknown platform yields no start commands, so callers can say so."""
+    monkeypatch.setattr(docker_util.platform, "system", lambda: "Plan9")
+    assert _REAL_START_COMMANDS("/bin/docker") == []
+
+
+def test_daemon_errors_name_the_node(monkeypatch):
+    """Every daemon failure message identifies the host it happened on.
+
+    Regression test for a real misdiagnosis: these steps run on a REMOTE node,
+    and a bare "Docker daemon is not running" sent an operator to verify Docker
+    on the laptop they were sitting at while the job kept failing on a
+    different machine. The hostname is what makes the message actionable.
+    """
+    monkeypatch.setattr(docker_util.platform, "node", lambda: "some-node.local")
+    monkeypatch.setattr(docker_util, "daemon_ready", lambda *a, **k: False)
+
+    # auto_start disabled
+    err = docker_util.ensure_daemon("/bin/docker", auto_start=False)
+    assert "some-node.local" in err
+
+    # no start mechanism for this platform
+    monkeypatch.setattr(docker_util.platform, "system", lambda: "Plan9")
+    err = docker_util.start_daemon("/bin/docker", wait=0)
+    assert "some-node.local" in err
+
+    # missing CLI
+    assert "some-node.local" in docker_util.docker_missing_error()
+
+
+def test_daemon_timeout_explains_why_the_start_failed(monkeypatch, no_sleep):
+    """A failed start surfaces the command's own stderr, plus the macOS GUI caveat.
+
+    "did not become ready within 120s" alone gives the operator nothing to act
+    on. The underlying reason (e.g. Docker Desktop refusing to start without a
+    login session) is the whole diagnosis.
+    """
+    monkeypatch.setattr(docker_util.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(docker_util.platform, "node", lambda: "air.local")
+    monkeypatch.setattr(docker_util, "daemon_ready", lambda *a, **k: False)
+    # The autouse fixture blanks _start_commands; restore the real one so the
+    # macOS candidates actually run and their failure reaches the message.
+    monkeypatch.setattr(docker_util, "_start_commands", _REAL_START_COMMANDS)
+
+    def _fake_run(cmd, **kwargs):
+        """Both macOS start candidates fail the way a headless session does."""
+        return _FakeCompleted(1, stderr="Unable to find application named 'Docker'")
+
+    monkeypatch.setattr(docker_util.subprocess, "run", _fake_run)
+
+    err = docker_util.start_daemon("/bin/docker", wait=0)
+    assert "air.local" in err
+    assert "Unable to find application" in err          # the real reason
+    assert "GUI login session" in err                   # the actionable caveat
+
+
+# ── ensure_daemon / start_daemon ──
+
+
+def test_ensure_daemon_ready_costs_one_probe_and_no_start(monkeypatch):
+    """The happy path is a single `docker info` and nothing else.
+
+    ensure_daemon sits in front of every docker step, so the ready path has to
+    stay cheap and side-effect free.
+    """
+    probes = []
+    monkeypatch.setattr(
+        docker_util, "daemon_ready", lambda *a, **k: (probes.append(a), True)[1]
+    )
+    monkeypatch.setattr(
+        docker_util,
+        "_start_commands",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not try to start a live daemon")),
+    )
+    log = []
+    assert docker_util.ensure_daemon("/bin/docker", log=log) is None
+    assert len(probes) == 1
+    assert log == []
+
+
+def test_ensure_daemon_auto_start_disabled_never_starts(monkeypatch):
+    """With auto_start False a dead daemon is reported, not started."""
+    monkeypatch.setattr(docker_util, "daemon_ready", lambda *a, **k: False)
+    monkeypatch.setattr(
+        docker_util,
+        "_start_commands",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("auto_start=False must not start Docker")),
+    )
+    err = docker_util.ensure_daemon("/bin/docker", auto_start=False)
+    assert "auto_start disabled" in err
+
+
+def test_ensure_daemon_starts_then_polls_until_ready(monkeypatch, no_sleep):
+    """A dead daemon is started and then polled until `docker info` succeeds.
+
+    Readiness must be polled rather than inferred from the start command's exit
+    status: `open -ga Docker` returns 0 the instant the app is launched, long
+    before the socket accepts connections.
+    """
+    monkeypatch.setattr(docker_util, "_start_commands", lambda *a, **k: [["open", "-ga", "Docker"]])
+    issued = []
+
+    def _fake_run(cmd, **kwargs):
+        """Record the start command and report it as launched."""
+        issued.append(cmd)
+        return _FakeCompleted(0)
+
+    monkeypatch.setattr(docker_util.subprocess, "run", _fake_run)
+
+    probes = {"n": 0}
+
+    def _ready(*a, **k):
+        """Report not-ready for the first two probes, ready on the third."""
+        probes["n"] += 1
+        return probes["n"] >= 3
+
+    monkeypatch.setattr(docker_util, "daemon_ready", _ready)
+
+    log = []
+    assert docker_util.ensure_daemon("/bin/docker", wait=120, log=log) is None
+    assert issued == [["open", "-ga", "Docker"]]
+    assert probes["n"] == 3
+    trail = "\n".join(log)
+    assert "not responding" in trail
+    assert "issued daemon start" in trail
+    assert "ready" in trail
+
+
+def test_ensure_daemon_times_out_without_hanging(monkeypatch, no_sleep):
+    """A daemon that never comes up fails with a bounded, diagnosable error.
+
+    The wait budget is asserted to be honoured against a fake clock, so a
+    regression that drops the deadline check would spin forever here instead of
+    quietly making every docker step block for its full timeout in production.
+    """
+    monkeypatch.setattr(docker_util, "_start_commands", lambda *a, **k: [["open", "-ga", "Docker"]])
+    monkeypatch.setattr(docker_util.subprocess, "run", lambda cmd, **kw: _FakeCompleted(0))
+    monkeypatch.setattr(docker_util, "daemon_ready", lambda *a, **k: False)
+
+    # Fake clock: every reading advances by one poll interval, so the deadline
+    # is reached in a bounded number of iterations with no real waiting.
+    clock = {"t": 0.0}
+
+    def _monotonic():
+        """Advance a fake monotonic clock by one poll interval per reading."""
+        clock["t"] += docker_util._POLL_INTERVAL
+        return clock["t"]
+
+    monkeypatch.setattr(docker_util.time, "monotonic", _monotonic)
+
+    err = docker_util.start_daemon("/bin/docker", wait=10, log=[])
+    assert "did not become ready within 10s" in err
+
+
+def test_start_daemon_polls_even_when_start_command_fails(monkeypatch, no_sleep):
+    """A failed start command is not fatal — the daemon may be coming up anyway.
+
+    Docker can already be mid-start from a login item or a concurrent job's
+    step, in which case waiting succeeds where issuing the start could not.
+    """
+    monkeypatch.setattr(
+        docker_util, "_start_commands", lambda *a, **k: [["systemctl", "start", "docker"]]
+    )
+    monkeypatch.setattr(
+        docker_util.subprocess,
+        "run",
+        lambda cmd, **kw: _FakeCompleted(1, stderr="Interactive authentication required"),
+    )
+    monkeypatch.setattr(docker_util, "daemon_ready", lambda *a, **k: True)
+
+    log = []
+    assert docker_util.start_daemon("/bin/docker", wait=5, log=log) is None
+    trail = "\n".join(log)
+    assert "failed" in trail
+    assert "polling anyway" in trail
+
+
+def test_start_daemon_reports_when_platform_has_no_mechanism(monkeypatch):
+    """With no known start mechanism the error names the platform, node, and next step."""
+    monkeypatch.setattr(docker_util, "_start_commands", lambda *a, **k: [])
+    monkeypatch.setattr(docker_util.platform, "system", lambda: "Plan9")
+    monkeypatch.setattr(docker_util.platform, "node", lambda: "odd-node")
+    err = docker_util.start_daemon("/bin/docker", wait=5)
+    assert "Plan9" in err
+    assert "odd-node" in err
+    assert "start Docker there" in err
+
+
+def test_start_daemon_error_flags_that_no_start_succeeded(monkeypatch, no_sleep):
+    """The timeout message distinguishes 'started but slow' from 'never started'.
+
+    Those need different operator responses — wait longer versus fix the start
+    mechanism — so the message must say which happened.
+    """
+    monkeypatch.setattr(
+        docker_util, "_start_commands", lambda *a, **k: [["systemctl", "start", "docker"]]
+    )
+    monkeypatch.setattr(
+        docker_util.subprocess, "run", lambda cmd, **kw: _FakeCompleted(1, stderr="denied")
+    )
+    monkeypatch.setattr(docker_util, "daemon_ready", lambda *a, **k: False)
+    clock = {"t": 0.0}
+
+    def _monotonic():
+        """Advance a fake monotonic clock by one poll interval per reading."""
+        clock["t"] += docker_util._POLL_INTERVAL
+        return clock["t"]
+
+    monkeypatch.setattr(docker_util.time, "monotonic", _monotonic)
+    err = docker_util.start_daemon("/bin/docker", wait=4, log=[])
+    assert "no start command succeeded" in err
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1600,8 +1994,283 @@ def test_gem5_run_container_no_docker(monkeypatch):
         {"config_script": "se.py", "container": "c1", "working_dir": "/w"},
         StepContext(),
     )
-    assert state["error"] == "docker binary not found on node"
+    assert state["error"] == docker_util.docker_missing_error()
     assert state["exit_code"] == -1
+
+
+# ── Container auto-ensure (daemon + container) ──
+
+
+class _FakePopen:
+    """Stand-in for subprocess.Popen that records the command and never spawns."""
+
+    def __init__(self, cmd, **kwargs):
+        """Record the argv and hand back a fixed pid."""
+        self.cmd = cmd
+        self.kwargs = kwargs
+        self.pid = 4242
+
+
+@pytest.fixture
+def gem5_container_env(monkeypatch):
+    """Drive gem5 container mode end-to-end without touching Docker or spawning gem5.
+
+    Returns a dict with the container-management commands (``docker``), the
+    ``docker exec`` calls the step itself made (``step``), and the Popen
+    instances created (``spawned``), so a test can assert on the whole sequence.
+
+    AI Note: one fake serves both layers because ``docker_util.subprocess`` and
+    ``run_sim_mod.subprocess`` are the SAME module object — patching the second
+    replaces the first. The split is therefore by subcommand, not by module.
+    """
+    monkeypatch.setattr(run_sim_mod, "_find_docker", lambda explicit: "/bin/docker")
+    seen: dict[str, list] = {"docker": [], "step": [], "spawned": []}
+
+    def _run(cmd, **kwargs):
+        """Route container management to 'docker' and `docker exec` to 'step'."""
+        sub = cmd[1]
+        if sub == "exec":
+            # The step's own call — `docker exec <c> mkdir -p <m5out>`.
+            seen["step"].append(cmd)
+            return _FakeCompleted(0)
+        seen["docker"].append(cmd)
+        if sub == "ps":
+            # Absent until `docker run`, present on the confirmation query.
+            ran = any(c[1] == "run" for c in seen["docker"])
+            return _FakeCompleted(0, stdout="c1" if ran else "")
+        if sub == "run":
+            return _FakeCompleted(0, stdout="newcontainerid")
+        return _FakeCompleted(0)
+
+    def _popen(cmd, **kwargs):
+        """Capture the gem5 launch instead of spawning a real process."""
+        p = _FakePopen(cmd, **kwargs)
+        seen["spawned"].append(p)
+        return p
+
+    monkeypatch.setattr(docker_util.subprocess, "run", _run)
+    monkeypatch.setattr(run_sim_mod.subprocess, "Popen", _popen)
+    return seen
+
+
+def test_gem5_run_container_defaults_enable_auto_start():
+    """auto_start defaults on, so a lone gem5_run_simulation step is self-sufficient.
+
+    This is the whole point of the change: a job that forgot (or never had) a
+    docker_ensure_container step ahead of it must still work.
+    """
+    p = RunSimulationParams(config_script="se.py")
+    assert p.auto_start is True
+    assert p.image.startswith("ghcr.io/gem5/")
+    assert p.mounts == []
+    assert p.daemon_wait == 120
+
+
+def test_gem5_run_container_creates_absent_container(gem5_container_env):
+    """An absent container is created and gem5 then runs inside it.
+
+    Reproduces the reported failure — container mode with nothing having created
+    the container — and asserts it now succeeds instead of dying on the first
+    `docker exec`.
+    """
+    step = RunSimulationStep()
+    state = step.startup(
+        {"config_script": "se.py", "container": "c1", "working_dir": "/w"},
+        StepContext(),
+    )
+    assert "error" not in state
+    assert state["pid"] == 4242
+    assert state["container"] == "c1"
+    # The container was created before the step's own `docker exec` ran.
+    run_cmd = next(c for c in gem5_container_env["docker"] if c[1] == "run")
+    assert run_cmd[-2:] == ["sleep", "infinity"]
+    assert gem5_container_env["step"], "the step should have exec'd mkdir after the ensure"
+    assert "creating container" in state["_log"]
+
+
+def test_gem5_run_container_created_with_working_dir_mounted_same_path(gem5_container_env):
+    """With no mounts given, working_dir is bind-mounted at the SAME path inside.
+
+    Container mode computes the binary, config and m5out paths once and uses
+    them on both sides, so a container created without this mount would resolve
+    none of them — the failure would just move somewhere harder to read.
+    """
+    step = RunSimulationStep()
+    state = step.startup(
+        {"config_script": "se.py", "container": "c1", "working_dir": "/work/gem5"},
+        StepContext(),
+    )
+    assert "error" not in state
+    run_cmd = next(c for c in gem5_container_env["docker"] if c[1] == "run")
+    assert "/work/gem5:/work/gem5" in run_cmd
+    # ...and the same path becomes the container's workdir.
+    assert run_cmd[run_cmd.index("-w") + 1] == "/work/gem5"
+    # m5out is derived from working_dir, so it lands under the mount.
+    assert state["m5out_path"].startswith("/work/gem5/m5out_nexus_")
+
+
+def test_gem5_run_container_explicit_mounts_replace_the_default(gem5_container_env):
+    """An explicit mounts list is used verbatim instead of the working_dir default."""
+    step = RunSimulationStep()
+    state = step.startup(
+        {
+            "config_script": "se.py",
+            "container": "c1",
+            "working_dir": "/work",
+            "mounts": ["/data:/data", "/models"],
+        },
+        StepContext(),
+    )
+    assert "error" not in state
+    run_cmd = next(c for c in gem5_container_env["docker"] if c[1] == "run")
+    assert "/data:/data" in run_cmd
+    assert "/models:/models" in run_cmd
+    assert "/work:/work" not in run_cmd
+
+
+def test_gem5_run_container_attaches_to_running_container(monkeypatch, gem5_container_env):
+    """A container that is already running is reused — no run, no start.
+
+    Idempotence matters here: re-running a job must not disturb a live container
+    that may hold build state from an earlier run.
+    """
+    monkeypatch.setattr(
+        docker_util.subprocess,
+        "run",
+        lambda cmd, **kw: (
+            gem5_container_env["docker"].append(cmd)
+            or _FakeCompleted(0, stdout="c1" if cmd[1] == "ps" else "")
+        ),
+    )
+    step = RunSimulationStep()
+    state = step.startup(
+        {"config_script": "se.py", "container": "c1", "working_dir": "/w"},
+        StepContext(),
+    )
+    assert "error" not in state
+    subcommands = [c[1] for c in gem5_container_env["docker"]]
+    assert "run" not in subcommands
+    assert "start" not in subcommands
+    assert "already running" in state["_log"]
+
+
+def test_gem5_run_container_daemon_down_is_named_not_disguised(monkeypatch):
+    """A dead daemon fails with a message about the daemon, before any docker exec.
+
+    The regression this replaces: the socket error surfaced as "could not create
+    m5out in container: Cannot connect to the Docker daemon...", which reads as
+    a gem5/container problem rather than "Docker isn't running".
+    """
+    monkeypatch.setattr(run_sim_mod, "_find_docker", lambda explicit: "/bin/docker")
+    monkeypatch.setattr(docker_util, "daemon_ready", lambda *a, **k: False)
+
+    def _no_exec(cmd, **kwargs):
+        """Fail the test if the step reaches its docker exec with no daemon."""
+        raise AssertionError(f"must not exec with the daemon down: {cmd}")
+
+    monkeypatch.setattr(run_sim_mod.subprocess, "run", _no_exec)
+    monkeypatch.setattr(run_sim_mod.subprocess, "Popen", _no_exec)
+    step = RunSimulationStep()
+    state = step.startup(
+        {
+            "config_script": "se.py",
+            "container": "c1",
+            "working_dir": "/w",
+            "auto_start": False,
+        },
+        StepContext(),
+    )
+    assert "Docker daemon is not running" in state["error"]
+    assert state["exit_code"] == -1
+    assert step.check(state) is StepResult.FAILED
+
+
+def test_gem5_run_container_probes_daemon_even_when_auto_start_off(monkeypatch):
+    """auto_start=False still probes the daemon — it only disables *fixing* it.
+
+    Turning the feature off should not restore the confusing socket error; the
+    operator still gets told what is actually wrong, just not helped.
+    """
+    monkeypatch.setattr(run_sim_mod, "_find_docker", lambda explicit: "/bin/docker")
+    probes = {"n": 0}
+
+    def _ready(*a, **k):
+        """Count daemon probes and report the daemon as up."""
+        probes["n"] += 1
+        return True
+
+    monkeypatch.setattr(docker_util, "daemon_ready", _ready)
+
+    def _exec_only(cmd, **kwargs):
+        """Allow the step's own `docker exec`, reject any container management."""
+        if cmd[1] != "exec":
+            raise AssertionError(f"auto_start=False must not manage the container: {cmd}")
+        return _FakeCompleted(0)
+
+    monkeypatch.setattr(run_sim_mod.subprocess, "run", _exec_only)
+    monkeypatch.setattr(run_sim_mod.subprocess, "Popen", _FakePopen)
+    step = RunSimulationStep()
+    state = step.startup(
+        {
+            "config_script": "se.py",
+            "container": "c1",
+            "working_dir": "/w",
+            "auto_start": False,
+        },
+        StepContext(),
+    )
+    assert "error" not in state
+    assert probes["n"] == 1
+
+
+def test_gem5_run_container_ensure_failure_aborts_before_exec(monkeypatch, gem5_container_env):
+    """A failed container create aborts the step with docker's own exit code.
+
+    Without this the step would go on to `docker exec` a container that does not
+    exist and report a much less useful error.
+    """
+    monkeypatch.setattr(
+        docker_util.subprocess,
+        "run",
+        lambda cmd, **kw: (
+            _FakeCompleted(0, stdout="")
+            if cmd[1] == "ps"
+            else _FakeCompleted(125, stderr="no such image")
+        ),
+    )
+    step = RunSimulationStep()
+    state = step.startup(
+        {"config_script": "se.py", "container": "c1", "working_dir": "/w"},
+        StepContext(),
+    )
+    assert "docker run failed" in state["error"]
+    assert state["exit_code"] == 125
+    assert gem5_container_env["step"] == [], "no docker exec after a failed ensure"
+    assert gem5_container_env["spawned"] == [], "gem5 must not be launched"
+    assert step.check(state) is StepResult.FAILED
+
+
+def test_gem5_run_direct_mode_never_touches_docker(monkeypatch):
+    """Direct (non-container) mode does no daemon probe and no container work.
+
+    The auto-ensure is strictly a container-mode concern; a node running gem5
+    natively must not have Docker started underneath it.
+    """
+    monkeypatch.setattr(
+        docker_util,
+        "daemon_ready",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("direct mode must not probe the Docker daemon")
+        ),
+    )
+    step = RunSimulationStep()
+    state = step.startup(
+        {"config_script": "se.py", "gem5_binary": "/usr/bin/true"}, StepContext()
+    )
+    assert "error" not in state
+    assert state["container"] is None
+    assert state["docker"] is None
+    assert state["_log"] == ""
 
 
 def test_gem5_run_direct_spawns_process(monkeypatch):
@@ -1969,7 +2638,7 @@ def test_gem5_collect_container_mode_no_docker(monkeypatch):
         {"m5out_path": "/in/container/m5out", "container": "c1"},
         StepContext(server_url="http://s", job_id="j", node_api_key="k"),
     )
-    assert state["error"] == "docker binary not found on node"
+    assert state["error"] == docker_util.docker_missing_error()
     assert step.check(state) is StepResult.FAILED
 
 
@@ -2009,6 +2678,66 @@ def test_gem5_collect_container_mode_tar_failure(monkeypatch):
     )
     assert "tar in container failed" in state["error"]
     assert step.check(state) is StepResult.FAILED
+
+
+def test_gem5_collect_container_daemon_down_named_not_disguised(monkeypatch):
+    """A daemon that died mid-job is named, instead of surfacing as a tar failure.
+
+    Docker Desktop quitting (or a laptop sleeping) between the simulation and
+    collection otherwise produced "tar in container failed: Cannot connect to
+    the Docker daemon...", which reads like a broken archive rather than a
+    stopped daemon — and would lose the results of a simulation that succeeded.
+    """
+    monkeypatch.setattr(collect_mod, "_find_docker", lambda explicit: "/bin/docker")
+    monkeypatch.setattr(docker_util, "daemon_ready", lambda *a, **k: False)
+
+    def _no_docker(cmd, **kwargs):
+        """Fail the test if any docker command runs with the daemon down."""
+        raise AssertionError(f"no docker command may run with the daemon down: {cmd}")
+
+    monkeypatch.setattr(collect_mod.subprocess, "run", _no_docker)
+    step = CollectResultsStep()
+    state = step.startup(
+        {
+            "m5out_path": "/in/container/m5out",
+            "container": "c1",
+            "auto_start_daemon": False,
+        },
+        StepContext(server_url="http://s", job_id="j", node_api_key="k"),
+    )
+    assert "Docker daemon is not running" in state["error"]
+    assert step.check(state) is StepResult.FAILED
+
+
+def test_gem5_collect_direct_mode_never_probes_daemon(monkeypatch, tmp_path):
+    """Host-mode collection does no daemon probe — there is no container involved."""
+    monkeypatch.setattr(
+        docker_util,
+        "daemon_ready",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("host-mode collection must not probe the Docker daemon")
+        ),
+    )
+    m5out = tmp_path / "m5out_nexus_test"
+    m5out.mkdir()
+    (m5out / "stats.txt").write_text("sim_seconds 1\n")
+
+    class _Resp:
+        """Minimal httpx response stand-in reporting HTTP 200."""
+
+        status_code = 200
+        text = "ok"
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "put", lambda url, **kwargs: _Resp())
+    step = CollectResultsStep()
+    state = step.startup(
+        {"m5out_path": str(m5out)},
+        StepContext(server_url="http://s", job_id="j", node_api_key="k"),
+    )
+    assert state["done"] is True
+    assert step.check(state) is StepResult.SUCCESS
 
 
 def test_gem5_collect_cancel_noop():

@@ -633,9 +633,7 @@ class FlowStep(ABC):
             # it published the literal "PydanticUndefined" as the field's default
             # into the public step-schema API and the job-builder UI. Call the
             # factory instead. Required fields still report None (their real
-            # default is the sentinel too, and there is nothing to publish), and
-            # any remaining non-primitive is stringified as a display hint, not a
-            # value a client can post back verbatim.
+            # default is the sentinel too, and there is nothing to publish).
             if field_info.default_factory is not None:
                 default_val = field_info.default_factory()
             elif not field_info.is_required():
@@ -645,7 +643,28 @@ class FlowStep(ABC):
             # Belt-and-braces: never let the sentinel reach JSON.
             if default_val is PydanticUndefined:
                 default_val = None
-            if default_val is not None and not isinstance(default_val, (str, int, float, bool)):
+            # AI Note: list/dict defaults are dumped as real JSON via the
+            # field's own TypeAdapter, not stringified. Regression fix — the
+            # old `str(default_val)` path published e.g. `"['cpu', 'memory']"`
+            # as the default, which JobBuilder's buildDefaultParams() then
+            # pre-filled into the form and submitted back VERBATIM AS A
+            # STRING on an unopened step, so Pydantic rejected it with
+            # "Input should be a valid list" — a step could not be submitted
+            # with its own default params. TypeAdapter (rather than bare
+            # json.dumps) is what correctly JSON-serializes non-trivial
+            # element types (UUID, Path, enum, ...) that could appear inside
+            # the collection. Any other remaining non-primitive default (a
+            # bare UUID/Path/enum field) still gets the str() display-hint
+            # treatment below — those aren't collections a client could
+            # meaningfully edit and repost anyway.
+            if isinstance(default_val, (list, dict)):
+                try:
+                    default_val = TypeAdapter(field_info.annotation).dump_python(
+                        default_val, mode="json",
+                    )
+                except Exception:
+                    default_val = str(default_val)
+            elif default_val is not None and not isinstance(default_val, (str, int, float, bool)):
                 default_val = str(default_val)
 
             fields.append({

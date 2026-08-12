@@ -3,9 +3,9 @@
 SUT: ``packages/server/src/nexus_server/api/routes/jobs.py``.
 
 Covers submission-time validation (unknown step, bad params, valid single-step
-job with accumulated upstream context), listing + filters, detail + 404, cancel
-(including the terminal-state 409), delete (terminal-only) and the plain-text
-log endpoint.
+job with accumulated upstream context), listing + filters, detail + 404, requeue
+(the exact-copy contract and its re-validation), cancel (including the
+terminal-state 409), delete (terminal-only) and the plain-text log endpoint.
 
 To keep these tests fast and deterministic we stub the runner's ``submit_job``
 on ``app.state.runner`` so submitting a job never spawns the real background
@@ -31,7 +31,8 @@ Status-code contract exercised here
       means the shape was fine but the step content was not.
     * 404 — unknown job id.
     * 409 — a state conflict: cancelling an already-terminal job, or deleting
-      one that is still running.
+      one that is still running. Note requeue is deliberately exempt: it copies
+      a job in any state, because the copy is independent of the original.
 """
 
 from __future__ import annotations
@@ -84,7 +85,8 @@ def _stub_runner_dispatch(app):
 
 
 async def _create_job(db, *, name="seeded-job", status="pending", steps=None,
-                      submitted_by=None, pool_id=None):
+                      submitted_by=None, pool_id=None, node_id=None,
+                      priority=1, storage_target=None):
     """Persist a job directly via ops (bypassing the route) for read/cancel/delete tests.
 
     Going around the POST handler keeps read-path tests independent of
@@ -101,6 +103,11 @@ async def _create_job(db, *, name="seeded-job", status="pending", steps=None,
         submitted_by: Owner user id (pass ``regular_user.id`` so the job is
             visible to the ``auth_client`` identity).
         pool_id: Optional ``target_pool_id`` for pool-filter tests.
+        node_id: Optional ``target_node_id``. Used by the requeue tests, which
+            assert the pin is carried onto the copy.
+        priority: Job priority; the requeue tests assert it is preserved.
+        storage_target: Optional storage backend name, likewise carried over by
+            requeue.
 
     Returns:
         The persisted ``Job``, re-fetched after a status change so the returned
@@ -114,6 +121,9 @@ async def _create_job(db, *, name="seeded-job", status="pending", steps=None,
         submitted_by=submitted_by,
         steps_config=steps or [{"step": "run_command", "params": {"command": "echo hi"}}],
         target_pool_id=pool_id,
+        target_node_id=node_id,
+        priority=priority,
+        storage_target=storage_target,
     )
     if status != "pending":
         await ops.update_job(db, job.id, status=status)
@@ -561,6 +571,218 @@ def test_delete_unknown_404(auth_client):
     """Deleting an unknown job is a 404."""
     resp = auth_client.delete(f"/api/jobs/{uuid.uuid4()}")
     assert resp.status_code == 404
+
+
+# ── POST /api/jobs/{id}/requeue ────────────────────────────────────────────
+#
+# The endpoint takes no body: it is an exact copy by design. These tests split
+# into "what carries over" (plan + targeting), "what deliberately does not"
+# (run state, and the submitter attribution) and "when it refuses".
+
+
+async def test_requeue_creates_new_job_with_same_plan(auth_client, db, regular_user):
+    """Requeue returns 201 with a NEW id whose plan matches the original's.
+
+    The distinct id is the load-bearing assertion — an endpoint that returned
+    the original job would look successful in the UI while nothing was queued.
+    """
+    steps = [
+        {"step": "run_command", "params": {"command": "echo one"}, "on_fail": "continue",
+         "target_node_id": None, "target_pool_id": None, "target_os": None},
+    ]
+    job = await _create_job(db, name="rerun-me", status="failed",
+                            steps=steps, submitted_by=regular_user.id)
+
+    resp = auth_client.post(f"/api/jobs/{job.id}/requeue")
+    assert resp.status_code == 201, resp.text
+    new = resp.json()
+    assert new["id"] != str(job.id)
+    assert new["name"] == "rerun-me"
+
+    # The copy's stored plan is fetched back through the detail endpoint rather
+    # than read off the ORM, so this also covers the JobDetail.steps_config wiring.
+    detail = auth_client.get(f"/api/jobs/{new['id']}").json()
+    assert detail["steps_config"] == steps
+
+
+async def test_requeue_preserves_targeting_and_priority(
+    auth_client, db, regular_user, sample_pool,
+):
+    """Pool/node pin, priority and storage target all carry onto the copy.
+
+    This is the "same params" contract: a job pinned to a pool must not quietly
+    become schedulable anywhere just because it was re-run.
+    """
+    job = await _create_job(
+        db, name="pinned", status="completed", submitted_by=regular_user.id,
+        pool_id=sample_pool.id, priority=7, storage_target="minio-main",
+    )
+
+    resp = auth_client.post(f"/api/jobs/{job.id}/requeue")
+    assert resp.status_code == 201, resp.text
+    new_id = resp.json()["id"]
+
+    from nexus_server.db import ops
+    new_job = await ops.get_job_by_id(db, new_id)
+    assert str(new_job.target_pool_id) == str(sample_pool.id)
+    assert new_job.priority == 7
+    assert new_job.storage_target == "minio-main"
+
+
+async def test_requeue_starts_clean_and_leaves_original_untouched(
+    auth_client, db, regular_user,
+):
+    """Run state belongs to the old attempt: the copy starts pending and empty.
+
+    Also pins the non-destructive half of the contract — requeue must never
+    mutate the job it copied, or the Jobs table would appear to lose history.
+    """
+    from nexus_server.db import ops
+
+    job = await _create_job(db, name="dirty", status="failed", submitted_by=regular_user.id)
+    await ops.append_job_log(db, job.id, "old output\n")
+    await ops.update_job(db, job.id, current_step=3, error="boom",
+                         context_data={"m5out_path": "/tmp/old"})
+
+    resp = auth_client.post(f"/api/jobs/{job.id}/requeue")
+    assert resp.status_code == 201, resp.text
+    new = resp.json()
+    assert new["status"] == "pending"
+    assert new["current_step"] == 0
+    assert new["error"] is None
+
+    new_detail = auth_client.get(f"/api/jobs/{new['id']}").json()
+    assert new_detail["context_data"] == {}
+    assert new_detail["has_log"] is False
+
+    # The original still carries its own failure state.
+    old_detail = auth_client.get(f"/api/jobs/{job.id}").json()
+    assert old_detail["job"]["status"] == "failed"
+    assert old_detail["job"]["error"] == "boom"
+    assert old_detail["has_log"] is True
+
+
+async def test_requeue_attributes_the_copy_to_the_caller(
+    auth_client, db, admin_user, regular_user,
+):
+    """The re-runner owns the new job, not the original submitter.
+
+    ``submitted_by`` answers "who caused this to run", so copying the original
+    submitter would misattribute a run the caller triggered.
+    """
+    job = await _create_job(db, name="someone-elses", status="completed",
+                            submitted_by=admin_user.id)
+    resp = auth_client.post(f"/api/jobs/{job.id}/requeue")
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["submitted_by"] == str(regular_user.id)
+
+
+async def test_requeue_dispatches_the_new_job(
+    auth_client, db, regular_user, _stub_runner_dispatch,
+):
+    """The runner is handed the NEW id — otherwise the copy would sit pending forever."""
+    job = await _create_job(db, name="dispatch-me", status="completed",
+                            submitted_by=regular_user.id)
+    resp = auth_client.post(f"/api/jobs/{job.id}/requeue")
+    assert resp.status_code == 201, resp.text
+    assert [str(c) for c in _stub_runner_dispatch] == [resp.json()["id"]]
+
+
+async def test_requeue_running_job_is_allowed(auth_client, db, regular_user):
+    """Requeue deliberately does NOT 409 on state, unlike cancel and delete.
+
+    The copy is an independent job sharing only a plan, so re-running something
+    still in flight is well-defined. The dashboard hides the button for active
+    jobs; that is a UX choice and not enforced here.
+    """
+    job = await _create_job(db, name="still-going", status="running",
+                            submitted_by=regular_user.id)
+    resp = auth_client.post(f"/api/jobs/{job.id}/requeue")
+    assert resp.status_code == 201, resp.text
+
+
+async def test_requeue_unknown_step_returns_400(
+    auth_client, db, regular_user, _stub_runner_dispatch,
+):
+    """A plan naming a step this build no longer registers is rejected, not queued.
+
+    This is the whole reason requeue re-validates instead of trusting the stored
+    plan: the step registry belongs to the current server build, so a plan that
+    validated at submission time can go stale under it.
+    """
+    job = await _create_job(
+        db, name="stale-plan", status="failed", submitted_by=regular_user.id,
+        steps=[{"step": "step_that_was_deleted", "params": {}}],
+    )
+    resp = auth_client.post(f"/api/jobs/{job.id}/requeue")
+    assert resp.status_code == 400, resp.text
+    assert "unknown step" in resp.json()["detail"]
+    # Nothing was dispatched — validation aborted before the runner was reached.
+    assert _stub_runner_dispatch == []
+
+
+async def test_requeue_unreadable_plan_returns_400(auth_client, db, regular_user):
+    """A stored plan that no longer parses as StepConfig is a 400, not a 500.
+
+    Contrast ``test_get_job_detail_tolerates_unreadable_plan``: the read path
+    degrades so the job stays inspectable, while this path — where the plan is
+    the entire payload — refuses loudly.
+    """
+    job = await _create_job(
+        db, name="corrupt-plan", status="failed", submitted_by=regular_user.id,
+        steps=[{"params": {"command": "echo hi"}}],  # no "step" key
+    )
+    resp = auth_client.post(f"/api/jobs/{job.id}/requeue")
+    assert resp.status_code == 400, resp.text
+    assert "could not be read" in resp.json()["detail"]
+
+
+def test_requeue_unknown_404(auth_client):
+    """Requeueing an unknown job is a 404."""
+    resp = auth_client.post(f"/api/jobs/{uuid.uuid4()}/requeue")
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "Job not found"
+
+
+def test_requeue_requires_authentication(client):
+    """Requeue is behind the user JWT like the rest of the dashboard surface."""
+    resp = client.post(f"/api/jobs/{uuid.uuid4()}/requeue")
+    assert resp.status_code in (401, 403)
+
+
+# ── GET /api/jobs/{id} — steps_config on the detail payload ────────────────
+
+
+async def test_get_job_detail_returns_steps_config(auth_client, db, regular_user):
+    """The detail payload carries the submitted plan, which "Duplicate" pre-fills from.
+
+    ``steps`` (execution records) and ``steps_config`` (the plan) are separate:
+    this job has never run, so the plan is present while ``steps`` is empty.
+    """
+    steps = [
+        {"step": "run_command", "params": {"command": "echo hi"}, "on_fail": "stop",
+         "target_node_id": None, "target_pool_id": None, "target_os": None},
+    ]
+    job = await _create_job(db, name="has-plan", steps=steps, submitted_by=regular_user.id)
+    data = auth_client.get(f"/api/jobs/{job.id}").json()
+    assert data["steps_config"] == steps
+    assert data["steps"] == []
+
+
+async def test_get_job_detail_tolerates_unreadable_plan(auth_client, db, regular_user):
+    """A plan that will not parse degrades to [] rather than breaking the detail page.
+
+    The detail endpoint also serves the log and results tabs, which is exactly
+    what you open when investigating a job whose plan went bad — a 500 here
+    would hide the evidence.
+    """
+    job = await _create_job(
+        db, name="bad-plan", submitted_by=regular_user.id,
+        steps=[{"params": {"command": "echo hi"}}],  # no "step" key
+    )
+    resp = auth_client.get(f"/api/jobs/{job.id}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["steps_config"] == []
 
 
 # ── GET /api/jobs/{id}/results — download + manifest (no-results path) ───────

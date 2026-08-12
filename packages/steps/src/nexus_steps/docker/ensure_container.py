@@ -27,10 +27,6 @@ again. Cleanup is an operator responsibility (or a ``recreate=true`` run).
 
 from __future__ import annotations
 
-import os
-import shutil
-import subprocess
-import tempfile
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -38,6 +34,8 @@ from pydantic import BaseModel, Field
 from nexus_common.models.enums import StepResult
 from nexus_common.steps.base import FlowStep, StepContext
 from nexus_common.steps.registry import register
+from nexus_steps.docker.util import ensure_container as _ensure_container
+from nexus_steps.docker.util import docker_missing_error, ensure_daemon, find_docker
 
 
 # ── Params ───────────────────────────────────────────────────────────────
@@ -81,6 +79,19 @@ class EnsureContainerParams(BaseModel):
         False,
         description="If true, remove an existing container with this name and recreate it.",
     )
+    auto_start_daemon: bool = Field(
+        True,
+        description=(
+            "If the Docker daemon isn't running, try to start it (Docker Desktop "
+            "on macOS, the docker service on Linux) and wait for it to be ready."
+        ),
+    )
+    daemon_wait: int = Field(
+        120,
+        description="Seconds to wait for the Docker daemon to become ready.",
+        ge=1,
+        le=3600,
+    )
     timeout: int = Field(
         600, description="Max time in seconds for image pull / container start.",
         ge=1, le=86400,
@@ -90,43 +101,13 @@ class EnsureContainerParams(BaseModel):
 # ── Step ─────────────────────────────────────────────────────────────────
 
 
-def _find_docker(explicit: str | None) -> str | None:
-    """Locate the ``docker`` CLI on this node.
-
-    Args:
-        explicit: A caller-supplied path; returned as-is without an existence
-            check, so an explicit-but-wrong path surfaces later as a
-            ``FileNotFoundError`` from ``subprocess.run`` rather than a clean
-            "not found" error here.
-
-    Returns:
-        The path to a docker binary, or ``None`` if nothing was found.
-
-    AI Note: the PATH lookup alone is not enough. Agents are commonly launched
-    as a LaunchAgent/systemd unit with a minimal PATH that omits
-    ``/usr/local/bin`` and ``/opt/homebrew/bin``, so Docker Desktop's shim is
-    invisible even though an interactive shell finds it. The hardcoded
-    candidate list is that workaround — the last entry is Docker Desktop's
-    in-bundle binary on macOS.
-
-    AI Note: this helper is duplicated verbatim in
-    ``nexus_steps.gem5.run_simulation`` and ``nexus_steps.gem5.collect_results``.
-    Keep the three copies in sync, or hoist one shared implementation.
-    """
-    if explicit:
-        return explicit
-    found = shutil.which("docker")
-    if found:
-        return found
-    for cand in (
-        "/usr/local/bin/docker",
-        "/opt/homebrew/bin/docker",
-        os.path.expanduser("~/.docker/bin/docker"),
-        "/Applications/Docker.app/Contents/Resources/bin/docker",
-    ):
-        if os.path.exists(cand):
-            return cand
-    return None
+# Docker discovery now lives in ``nexus_steps.docker.util`` (one copy, shared
+# with the two gem5 steps that used to carry verbatim duplicates).
+#
+# AI Note: this module-level alias is not merely cosmetic — the unit tests
+# monkeypatch ``ensure_container._find_docker``, and ``startup()`` below must
+# keep calling it through this name for those patches to bind.
+_find_docker = find_docker
 
 
 @register("docker_ensure_container")
@@ -149,11 +130,12 @@ class EnsureContainerStep(FlowStep):
     # ── Lifecycle ──
 
     def startup(self, params: dict[str, Any], ctx: StepContext) -> dict[str, Any]:
-        """Attach to, start, or create the named container — synchronously.
+        """Ensure the daemon is up, then attach/start/create the container.
 
-        Decision order: ``recreate`` → running (attach) → exists-but-stopped
-        (start) → absent (run). A final ``docker ps`` confirms the container is
-        actually up before reporting success.
+        The container decision order — ``recreate`` → running (attach) →
+        exists-but-stopped (start) → absent (run), with a final ``docker ps``
+        confirmation — lives in :func:`nexus_steps.docker.util.ensure_container`
+        so ``gem5_run_simulation`` applies exactly the same rules.
 
         Args:
             params: Raw step params.
@@ -184,136 +166,54 @@ class EnsureContainerStep(FlowStep):
 
         docker = _find_docker(validated.docker)
         if not docker:
-            return {"error": "docker binary not found on node", "exit_code": -1}
-
-        name = validated.name
-
-        def _docker(*args: str, timeout: int = 60) -> subprocess.CompletedProcess:
-            """Run a docker subcommand, capturing output.
-
-            Args:
-                *args: Arguments appended after the docker binary (argv list —
-                    no shell, so nothing is word-split).
-                timeout: Per-call seconds budget. The 60 s default suits the
-                    quick query commands; slow operations (``rm -f``, ``start``,
-                    ``run``) pass a larger value explicitly.
-
-            Returns:
-                The ``CompletedProcess``; the return code is checked by callers
-                rather than raised (no ``check=True``).
-
-            Raises:
-                subprocess.TimeoutExpired: propagates to ``startup()``'s handler,
-                    which converts it into an error state.
-            """
-            return subprocess.run(
-                [docker, *args], capture_output=True, text=True, timeout=timeout,
-            )
+            return {"error": docker_missing_error(), "exit_code": -1}
 
         # Human-readable trail of what was decided, surfaced as "_log" in the
         # returned state for debugging.
         log: list[str] = []
-        created = False
-        try:
-            # Is a container with this name running / present?
-            #
-            # AI Note: `name=^{name}$` anchors the filter — docker's --filter
-            # name= is a substring match by default, so without the anchors a
-            # container called "gem5_img_old" would satisfy a query for
-            # "gem5_img". The `{{.Names}}` format plus the `== name` comparisons
-            # below then make the match exact.
-            running = _docker(
-                "ps", "--filter", f"name=^{name}$", "--format", "{{.Names}}"
-            ).stdout.strip()
-            exists = _docker(
-                "ps", "-a", "--filter", f"name=^{name}$", "--format", "{{.Names}}"
-            ).stdout.strip()
 
-            if validated.recreate and exists == name:
-                log.append(f"removing existing container '{name}' (recreate=true)")
-                # AI Note: `rm -f` result is intentionally not checked — if the
-                # removal fails, the `docker run` below fails loudly with a
-                # name-conflict error, which is a better message anyway. Any
-                # state inside the old container is destroyed here.
-                _docker("rm", "-f", name, timeout=120)
-                exists = ""
-                running = ""
+        # A live daemon is a precondition for every docker call that follows.
+        #
+        # AI Note: finding the binary is NOT evidence the daemon is up. Docker
+        # Desktop installs the CLI shim permanently, so `_find_docker` happily
+        # returns a path while `docker ps` fails with "Cannot connect to the
+        # Docker daemon". That gap is exactly what used to surface downstream as
+        # an unreadable m5out error in gem5_run_simulation.
+        daemon_err = ensure_daemon(
+            docker, validated.auto_start_daemon, validated.daemon_wait, log,
+        )
+        if daemon_err:
+            return {"error": daemon_err, "exit_code": -1, "_log": "\n".join(log)}
 
-            if running == name:
-                log.append(f"container '{name}' already running — attaching")
-                # AI Note: the attach path does NOT verify that the running
-                # container's image, mounts or workdir match the requested ones.
-                # A container left over from an earlier job with different
-                # mounts is silently reused; use recreate=true when the mount
-                # set changes, or the gem5 paths will not resolve.
-            elif exists == name:
-                log.append(f"container '{name}' exists but stopped — starting")
-                r = _docker("start", name, timeout=120)
-                if r.returncode != 0:
-                    return {"error": f"docker start failed: {r.stderr.strip()}",
-                            "exit_code": r.returncode, "_log": "\n".join(log)}
-            else:
-                # Build `docker run -d --name ... -v ... -w ... image <keepalive>`.
-                args = ["run", "-d", "--name", name]
-                for m in validated.mounts:
-                    # AI Note: bare "HOST" is expanded to "HOST:HOST" so the
-                    # path is identical inside and outside the container. The
-                    # whole container-mode gem5 design depends on that: the
-                    # binary path, config path and m5out path are computed once
-                    # and used on both sides without translation.
-                    spec = m if ":" in m else f"{m}:{m}"  # same path in-container
-                    args += ["-v", spec]
-                if validated.workdir:
-                    args += ["-w", validated.workdir]
-                # Keep-alive so the container stays up for later exec steps.
-                #
-                # AI Note: the image's own entrypoint/CMD is replaced by
-                # `sleep infinity`. Without it a gem5 image would run its
-                # default command and exit immediately, leaving nothing to
-                # `docker exec` into. This also means image entrypoint setup
-                # logic never runs.
-                args += [validated.image, "sleep", "infinity"]
-                log.append(f"creating container '{name}' from {validated.image}")
-                # `timeout` covers the image pull too, which is why the default
-                # is 600 s rather than the 60 s used for queries.
-                r = _docker(*args, timeout=validated.timeout)
-                if r.returncode != 0:
-                    return {"error": f"docker run failed: {r.stderr.strip()}",
-                            "exit_code": r.returncode, "_log": "\n".join(log)}
-                created = True
-
-            # Confirm it's up now.
-            #
-            # AI Note: this re-query is not redundant. `docker run -d` succeeds
-            # as soon as the container is created, so a container whose
-            # keep-alive command dies instantly (bad image, wrong architecture)
-            # would otherwise be reported as ready and every later `docker exec`
-            # would fail with a confusing error.
-            up = _docker(
-                "ps", "--filter", f"name=^{name}$", "--format", "{{.Names}}"
-            ).stdout.strip()
-            if up != name:
-                return {"error": f"container '{name}' is not running after ensure",
-                        "exit_code": 1, "_log": "\n".join(log)}
-
+        result = _ensure_container(
+            docker,
+            name=validated.name,
+            image=validated.image,
+            mounts=validated.mounts,
+            workdir=validated.workdir,
+            recreate=validated.recreate,
+            timeout=validated.timeout,
+            log=log,
+        )
+        if result.error:
             return {
-                "container": name,
-                "docker": docker,
-                "created": created,
-                "exit_code": 0,
-                # Display-only: StepExecutor._capture() reads _command_str for
-                # the per-job terminal log. It is NOT the command that ran.
-                "_command_str": f"docker ensure-container {name} ({validated.image})",
+                "error": result.error,
+                "exit_code": result.exit_code,
                 "_log": "\n".join(log),
             }
-        except subprocess.TimeoutExpired:
-            return {"error": "docker command timed out", "exit_code": -1, "_log": "\n".join(log)}
-        except Exception as exc:  # noqa: BLE001
-            # AI Note: the broad catch is deliberate. Docker failures are wildly
-            # varied (daemon not running, socket permission denied, DNS failure
-            # during pull); converting them all into a clean error state gives
-            # the operator a readable job log instead of an agent stack trace.
-            return {"error": f"{type(exc).__name__}: {exc}", "exit_code": -1, "_log": "\n".join(log)}
+
+        return {
+            "container": validated.name,
+            "docker": docker,
+            "created": result.created,
+            "exit_code": 0,
+            # Display-only: StepExecutor._capture() reads _command_str for
+            # the per-job terminal log. It is NOT the command that ran.
+            "_command_str": (
+                f"docker ensure-container {validated.name} ({validated.image})"
+            ),
+            "_log": "\n".join(log),
+        }
 
     def check(self, state: dict[str, Any]) -> StepResult:
         """Report the outcome recorded by ``startup()``. Pure and idempotent.

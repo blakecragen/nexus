@@ -318,6 +318,59 @@ describe("api.login", () => {
   });
 });
 
+// ── api.requeueJob (bodyless POST) ───────────────────────────────────────────
+
+/**
+ * Re-queueing is the one mutating call that sends no body at all: the server
+ * copies name, plan, targeting and priority off the stored job. That makes the
+ * *absence* of a body part of the contract rather than an omission.
+ */
+describe("api.requeueJob", () => {
+  /**
+   * Regression guarded: sending `{}` (or the original job) as a body. The
+   * endpoint takes no parameters, so a body is at best ignored and at worst a
+   * 422 — and it would imply the caller can influence the copy, which it
+   * cannot.
+   */
+  it("POSTs to /jobs/{id}/requeue with no body", async () => {
+    const fetchSpy = mockFetch([jsonResponse({ id: "new-job" })]);
+
+    await api.requeueJob("job-1");
+
+    expect(fetchSpy.mock.calls[0][0]).toBe("/api/jobs/job-1/requeue");
+    const init = fetchSpy.mock.calls[0][1];
+    expect(init.method).toBe("POST");
+    expect(init.body).toBeUndefined();
+  });
+
+  /**
+   * The response is the NEW job. Regression guarded: returning the original (or
+   * nothing), which would leave the detail page navigating back to the job the
+   * user just asked to re-run.
+   */
+  it("resolves with the newly created job", async () => {
+    mockFetch([jsonResponse({ id: "new-job", name: "nightly", status: "pending" })]);
+
+    await expect(api.requeueJob("job-1")).resolves.toEqual({
+      id: "new-job",
+      name: "nightly",
+      status: "pending",
+    });
+  });
+
+  /**
+   * A stored plan that no longer validates comes back as a 400 with the same
+   * `detail` shape POST /api/jobs uses, so the message reaches the UI intact.
+   */
+  it("throws with the server's detail message when the stored plan is rejected", async () => {
+    mockFetch([jsonResponse({ detail: "Step 0 references unknown step 'gem5_run'" }, 400)]);
+
+    await expect(api.requeueJob("job-1")).rejects.toThrow(
+      "Step 0 references unknown step 'gem5_run'"
+    );
+  });
+});
+
 // ── api.listNodes query string ────────────────────────────────────────────────
 
 /** Query-string construction for the filterable list endpoint. */

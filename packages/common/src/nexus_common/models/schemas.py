@@ -356,14 +356,29 @@ class JobDetail(BaseModel):
     Attributes:
         job: Summary row.
         steps: Every StepRun attempt for this job, including repeats at the same index.
+        steps_config: The *submitted plan* — the job's ``steps_config`` column,
+            which is what "Duplicate" pre-fills the Job Builder from and what
+            ``POST /api/jobs/{id}/requeue`` re-submits.
         context_data: Accumulated outputs merged from completed steps; the values
             that ``${var}`` references resolve against.
         has_log: Whether a terminal transcript exists at ``/api/jobs/{id}/log``.
             A boolean rather than the text itself so list/detail payloads stay small.
         has_results: Whether a results tarball exists to download.
+
+    AI Note: ``steps`` and ``steps_config`` are easy to confuse and are not
+    parallel lists. ``steps_config`` is the plan — one entry per position, fixed
+    at submission. ``steps`` is the execution record — one entry per *attempt*,
+    so a loop produces several entries at the same ``step_index`` and a job that
+    never started produces none at all. Never zip them.
+
+    AI Note: ``steps_config`` is exposed on the single-job detail view only. It
+    is deliberately absent from ``JobInfo`` (see ``_job_to_info`` in
+    ``routes/jobs.py``) because the list endpoint returns up to 50 rows and the
+    plan is unbounded JSON.
     """
     job: JobInfo
     steps: list[StepRunInfo]
+    steps_config: list[StepConfig] = Field(default_factory=list)
     context_data: dict = Field(default_factory=dict)
     has_log: bool = False
     has_results: bool = False

@@ -688,18 +688,22 @@ def test_to_schema_field_type_mapping_covers_all_simple_types():
     assert fields["a_str"]["field_type"] == "string"
 
 
-def test_to_schema_non_primitive_default_serialized_to_string():
-    # A list default is not (str|int|float|bool), so to_schema() stringifies it.
-    """A default_factory default is resolved by CALLING the factory, then stringified.
+def test_to_schema_default_factory_resolves_sentinel():
+    """A default_factory default is resolved by CALLING the factory, not stringifying the sentinel.
 
     Regression test for a real bug: ``field_info.default`` is the
     ``PydanticUndefined`` sentinel for ``default_factory`` fields while
-    ``is_required()`` returns False, so the serializer used to stringify the
-    sentinel and publish the literal string ``"PydanticUndefined"`` as the
-    field's default — into the public step-schema API and the job-builder UI.
-    ``to_schema`` now invokes the factory first. The published value is still a
-    *string* for non-primitive defaults (a display hint, not a postable value),
-    which is what the assertions below pin.
+    ``is_required()`` returns False, so the serializer used to publish the
+    literal string ``"PydanticUndefined"`` as the field's default — into the
+    public step-schema API and the job-builder UI. ``to_schema`` now invokes
+    the factory first.
+
+    A second bug, fixed alongside this one: list/dict defaults used to be
+    stringified too (``"['a', 'b']"``), which JobBuilder's
+    buildDefaultParams() then pre-filled into the form and submitted back
+    VERBATIM AS A STRING — so a step could not even be submitted with its own
+    default params (Pydantic: "Input should be a valid list"). They are now
+    dumped as real JSON via the field's TypeAdapter instead.
     """
     class _DefParams(BaseModel):
         """Params using default_factory, which triggers the sentinel-export bug."""
@@ -711,7 +715,26 @@ def test_to_schema_non_primitive_default_serialized_to_string():
 
     field = _DefStep.to_schema()["fields"][0]
     assert field["name"] == "tags"
-    assert field["default"] == str(["a", "b"])
+    assert field["default"] == ["a", "b"]
+    assert isinstance(field["default"], list)
+
+
+def test_to_schema_non_primitive_scalar_default_serialized_to_string():
+    """A non-collection, non-primitive default (e.g. a bare UUID/Path/enum field)
+    still gets the str() display-hint treatment — only list/dict defaults were
+    the ones a client could meaningfully edit and repost as JSON."""
+    import uuid
+
+    class _UuidParams(BaseModel):
+        """A field whose default is a UUID instance, not a JSON primitive."""
+        token: uuid.UUID = uuid.UUID("12345678-1234-5678-1234-567812345678")
+
+    class _UuidStep(_DummyStep):
+        """Step carrying the UUID-default params schema."""
+        PARAMS_SCHEMA = _UuidParams
+
+    field = _UuidStep.to_schema()["fields"][0]
+    assert field["default"] == str(uuid.UUID("12345678-1234-5678-1234-567812345678"))
     assert isinstance(field["default"], str)
 
 

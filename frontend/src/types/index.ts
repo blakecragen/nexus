@@ -120,11 +120,22 @@ export interface PoolInfo {
  *   upstream output key is actually produced by an earlier step.
  * @property on_fail `"stop"` (default) aborts the job; `"continue"` runs the
  *   next step anyway.
+ * @property target_node_id / target_pool_id / target_os per-step scheduling
+ *   overrides that beat the job-level targets.
+ *
+ * AI Note: the Job Builder has no UI for `on_fail` or the three `target_*`
+ * fields — only the `.nexus` DSL parser sets them. They are declared here so
+ * that reading a plan back off `JobDetail.steps_config` and re-submitting it
+ * ("Duplicate") round-trips those fields instead of silently resetting a step
+ * to `on_fail: "stop"` on the default target.
  */
 export interface StepConfig {
   step: string;
   params: Record<string, unknown>;
   on_fail?: "stop" | "continue";
+  target_node_id?: UUID | null;
+  target_pool_id?: UUID | null;
+  target_os?: string | null;
 }
 
 /**
@@ -177,10 +188,22 @@ export interface StepRunInfo {
  * `has_log` / `has_results` are optional booleans the page uses to decide
  * whether to offer the log view and the results tree / Download button; treat a
  * missing value as false (older servers omit them).
+ *
+ * AI Note: `steps` and `steps_config` are NOT parallel arrays. `steps_config` is
+ * the submitted plan — one entry per position. `steps` is the execution record —
+ * one entry per *attempt*, so a loop yields several at the same `step_index` and
+ * a job that never started yields none. Never index one by the other.
  */
 export interface JobDetail {
   job: JobInfo;
   steps: StepRunInfo[];
+  /**
+   * The submitted plan, used to pre-fill the Job Builder from "Duplicate".
+   * Optional because older servers omit it, and `[]` when the stored plan could
+   * not be parsed — treat both as "duplication unavailable" rather than
+   * "this job has no steps".
+   */
+  steps_config?: StepConfig[];
   context_data: Record<string, unknown>;
   has_log?: boolean;
   has_results?: boolean;

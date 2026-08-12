@@ -81,8 +81,18 @@ load_env() {
 
 # ── Preflight ───────────────────────────────────────────────────────────
 # Verify the four required tools exist and that the Docker daemon is actually
-# running (not just installed). Exits 1 with the full list of what's missing so
-# the user fixes everything in one pass rather than one error at a time.
+# running (not just installed) — starting it if it is not. Exits 1 with the full
+# list of what's missing so the user fixes everything in one pass rather than
+# one error at a time.
+#
+# AI Note: mirrors nexus_steps.docker.util.ensure_daemon(), which does the same
+# job on compute nodes. Keep the two in step: `docker desktop start` is tried
+# before `open -ga Docker` for the same reason (it works without an active GUI
+# session), and readiness is POLLED rather than inferred from the start
+# command's exit status, because both return 0 the instant Docker Desktop is
+# launched — tens of seconds before the socket accepts connections. Treating
+# that 0 as success is what used to produce a "docker daemon not running"
+# failure moments after a "Docker started" success line.
 check_deps() {
     local missing=()
     command -v docker  &>/dev/null || missing+=("docker")
@@ -95,22 +105,50 @@ check_deps() {
         exit 1
     fi
 
-    if ! docker info &>/dev/null; then
-        err "Docker daemon is not running. Start Docker Desktop and try again."
-        exit 1
-    fi
+    ensure_docker_daemon
 
     ok "All dependencies found."
+}
+
+# Bring the Docker daemon up if it is not already, then block until it answers.
+# Fatal if it never becomes ready — Redis and MinIO cannot start without it.
+ensure_docker_daemon() {
+    if docker info &>/dev/null; then
+        return 0
+    fi
+
+    info "Docker daemon is not responding — trying to start it..."
+    # `docker desktop start` (Docker Desktop 4.37+) first; `open -ga Docker`
+    # for older installs. -g keeps Docker from stealing focus.
+    docker desktop start &>/dev/null \
+        || open -ga Docker &>/dev/null \
+        || warn "Could not issue a Docker start command — waiting in case it is already starting."
+
+    local waited=0 limit=120
+    until docker info &>/dev/null; do
+        if (( waited >= limit )); then
+            err "Docker daemon did not become ready within ${limit}s."
+            err "Start Docker Desktop manually and re-run. (On macOS it only runs"
+            err "inside an active GUI login session.)"
+            exit 1
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+    ok "Docker daemon is ready (after ${waited}s)."
 }
 
 # ── Infrastructure (Redis + MinIO only) ─────────────────────────────────
 # Bring up the two stateful services and block until each is genuinely ready
 # (not merely "container created"), then print the connection summary.
 #
-# AI Note: only `redis minio` are named — docker-compose.yml also defines API
-# and frontend services, which dev mode deliberately does NOT use (they run
-# from source with hot reload instead). Adding services here would start
-# duplicates fighting for :8000/:3000.
+# AI Note: `redis minio` are named explicitly because those are the only two
+# services docker-compose.yml actually defines. Dev mode runs the API and the
+# frontend from source with hot reload instead, and there are deliberately no
+# compose services for them. (An earlier version of this note claimed the
+# compose file "also defines API and frontend services"; it does not, and
+# Dockerfile.frontend's `proxy_pass http://api:8000` refers to a service that
+# exists in no compose network — see AUDIT.md.)
 start_infra() {
     info "Starting infrastructure (Redis, MinIO)..."
     # `down --remove-orphans` first so containers from an older compose file
@@ -168,7 +206,42 @@ install_python() {
         python3 -m venv .venv
     fi
     source .venv/bin/activate
-    pip install --quiet -e packages/common -e packages/steps -e packages/server 2>&1 | tail -5
+
+    # AI Note: always invoke pip as `$VENV_PY -m pip`, NEVER as a bare `pip`.
+    # A venv created by `uv venv` (or `python -m venv --without-pip`) has no
+    # pip in .venv/bin, so a bare `pip` silently falls through PATH to the
+    # SYSTEM pip. On this machine that is Homebrew's python@3.14 pip, which
+    # (a) refuses with PEP 668 "externally-managed-environment", and worse
+    # (b) would target 3.14 while the activated venv is 3.11. Activating does
+    # not protect against this: `activate` only prepends .venv/bin to PATH, and
+    # if pip isn't in there the next match on PATH wins.
+    local venv_py=".venv/bin/python"
+
+    # Self-heal a pip-less venv rather than failing. ensurepip is stdlib, so
+    # this works offline.
+    #
+    # AI Note: ensurepip does not necessarily create a bare `pip` shim — on the
+    # uv-made venv here it produced only pip3 and pip3.11 — which is the second
+    # reason the `-m pip` form above is mandatory rather than stylistic.
+    if ! "$venv_py" -m pip --version &>/dev/null; then
+        info "venv has no pip (uv-created?) — bootstrapping with ensurepip..."
+        if ! "$venv_py" -m ensurepip --upgrade &>/dev/null; then
+            err "Could not bootstrap pip into .venv."
+            err "Recreate it with:  rm -rf .venv && python3 -m venv .venv"
+            exit 1
+        fi
+    fi
+
+    # AI Note: the exit status checked here is pip's, not tail's — hence
+    # PIPESTATUS. Piping straight into `tail` (as this used to) makes the
+    # pipeline report tail's success and hides a failed install completely.
+    "$venv_py" -m pip install --quiet \
+        -e packages/common -e packages/steps -e packages/server 2>&1 | tail -5
+    if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
+        err "pip install failed (see the output above)."
+        err "Interpreter: $("$venv_py" -c 'import sys; print(sys.executable, sys.version.split()[0])')"
+        exit 1
+    fi
 
     # AI Note: on this machine (project lives under iCloud Drive), the
     # editable-install shim files pip just (re)generated
