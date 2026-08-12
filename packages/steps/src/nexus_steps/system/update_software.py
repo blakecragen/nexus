@@ -69,19 +69,40 @@ def _detect_repo_dir() -> str | None:
 def _unhide_editable_pth(venv_python: str) -> None:
     """Best-effort clear of macOS's UF_HIDDEN flag on editable-install .pth shims.
 
-    Python 3.13+'s ``site.py`` silently SKIPS hidden ``.pth`` files (see
-    ``site.addpackage``), and setuptools' editable-wheel writer has been
-    observed leaving that flag set on the ``_editable_impl_*.pth`` files it
-    generates — breaking every import of the packages just installed with no
-    hint why (a bare ``ModuleNotFoundError`` and nothing else). This is a
-    defensive touch-up, not part of the actual update, so failures here are
-    swallowed; Linux has no ``chflags`` at all, hence the platform check.
+    Current CPython's ``site.py`` silently SKIPS hidden ``.pth`` files (see
+    ``site.addpackage``'s ``UF_HIDDEN`` check), and setuptools' editable-wheel
+    writer has been observed leaving that flag set on the
+    ``_editable_impl_*.pth`` files it generates — breaking every import of the
+    packages just installed with no hint why (a bare ``ModuleNotFoundError``
+    and nothing else). This is a defensive touch-up, not part of the actual
+    update, so failures here are swallowed; Linux has no ``chflags`` at all,
+    hence the platform check.
+
+    AI Note: verified empirically on 3.11.14 as well as 3.14 — the UF_HIDDEN
+    check was backported, so this is NOT a 3.13+-only concern. An earlier
+    version of this docstring said "3.13+", which would tell a reader on 3.11
+    they were safe when they are not.
+
+    AI Note: the site-packages directory is obtained by ASKING the interpreter
+    (``sysconfig``), never by walking up from ``venv_python``. A venv's
+    ``bin/python`` is a symlink to the base interpreter, so the previous
+    ``Path(venv_python).resolve().parent.parent / "lib"`` resolved straight out
+    of the venv and globbed the base interpreter's lib directory instead —
+    matching zero files, which meant this self-heal never ran on the very
+    layout ``python -m venv`` produces. Reproduced: the glob returned [] while
+    the real venv held 3 matching shims.
     """
     if sys.platform != "darwin":
         return
     try:
-        lib_dir = Path(venv_python).resolve().parent.parent / "lib"
-        for pth in lib_dir.glob("python*/site-packages/_editable_impl_*.pth"):
+        # Ask the target interpreter where ITS site-packages actually is.
+        purelib = subprocess.run(
+            [venv_python, "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+            capture_output=True, text=True, timeout=30,
+        ).stdout.strip()
+        if not purelib:
+            return
+        for pth in Path(purelib).glob("_editable_impl_*.pth"):
             subprocess.run(["chflags", "nohidden", str(pth)], capture_output=True, timeout=10)
     except Exception:
         pass

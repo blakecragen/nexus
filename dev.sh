@@ -232,10 +232,42 @@ install_python() {
         fi
     fi
 
+    # ── Build backend ───────────────────────────────────────────────────
+    # All three packages declare `build-backend = "hatchling.build"`, so pip
+    # builds each one in an isolated env that it populates by DOWNLOADING
+    # hatchling. On a network where PyPI is unreachable that download is the
+    # first thing that fails, and the resulting message
+    # ("pip subprocess to install build dependencies did not run successfully")
+    # names neither hatchling nor the proxy — it reads like a broken package.
+    #
+    # AI Note: pip does not read $UV_INDEX_URL, only $PIP_INDEX_URL. On this
+    # machine the Apple mirror is configured in the former, so without this
+    # bridge a working `uv pip install` sits right next to a failing
+    # `pip install` and the difference looks inexplicable.
+    if [[ -z "${PIP_INDEX_URL:-}" && -n "${UV_INDEX_URL:-}" ]]; then
+        export PIP_INDEX_URL="$UV_INDEX_URL"
+        info "Using package index from \$UV_INDEX_URL for pip."
+    fi
+
+    # Seed the backend into the venv once, then build with isolation OFF so no
+    # later install has to reach the network for it at all.
+    if ! "$venv_py" -c "import hatchling" &>/dev/null; then
+        info "Installing build backend (hatchling)..."
+        if ! "$venv_py" -m pip install --quiet hatchling editables 2>&1 | tail -3; then
+            err "Could not install the hatchling build backend."
+            err "Set PIP_INDEX_URL (or UV_INDEX_URL) to a reachable index and re-run."
+            exit 1
+        fi
+    fi
+
     # AI Note: the exit status checked here is pip's, not tail's — hence
     # PIPESTATUS. Piping straight into `tail` (as this used to) makes the
     # pipeline report tail's success and hides a failed install completely.
-    "$venv_py" -m pip install --quiet \
+    #
+    # AI Note: --no-build-isolation is paired with the seeding above and is NOT
+    # combined with --no-deps: runtime dependencies must still be resolved and
+    # installed, only the throwaway build env is skipped.
+    "$venv_py" -m pip install --quiet --no-build-isolation \
         -e packages/common -e packages/steps -e packages/server 2>&1 | tail -5
     if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
         err "pip install failed (see the output above)."
@@ -243,13 +275,34 @@ install_python() {
         exit 1
     fi
 
+    # Editable installs record an ABSOLUTE path. Moving the checkout (e.g. into
+    # iCloud Drive) leaves every .pth pointing at a directory that no longer
+    # exists, and every import then fails with a bare ModuleNotFoundError that
+    # says nothing about the stale path. Verify and self-heal instead.
+    #
+    # AI Note: this is not hypothetical — the venv was built at
+    # ~/Desktop/Network_Items/... before the project moved under
+    # ~/Library/Mobile Documents/.../Desktop/, and every nexus_* import broke
+    # with no indication that a path was the cause.
+    if ! "$venv_py" -c "import nexus_server, nexus_common, nexus_steps" &>/dev/null; then
+        warn "Editable installs do not import — reinstalling (stale recorded path?)."
+        "$venv_py" -m pip install --quiet --force-reinstall --no-build-isolation --no-deps \
+            -e packages/common -e packages/steps -e packages/server 2>&1 | tail -5
+    fi
+
     # AI Note: on this machine (project lives under iCloud Drive), the
     # editable-install shim files pip just (re)generated
     # (_editable_impl_*.pth) come back with the macOS UF_HIDDEN flag set.
-    # Python 3.14's site.py silently SKIPS hidden .pth files, so nexus_common/
-    # nexus_steps/nexus_server never land on sys.path and every import fails
-    # with a bare "ModuleNotFoundError: No module named 'nexus_server'" that
-    # gives no hint why. `chflags` is macOS-only, hence the command -v guard.
+    # Current CPython's site.py silently SKIPS hidden .pth files, so
+    # nexus_common/nexus_steps/nexus_server never land on sys.path and every
+    # import fails with a bare "ModuleNotFoundError: No module named
+    # 'nexus_server'" that gives no hint why. `chflags` is macOS-only, hence
+    # the command -v guard.
+    #
+    # AI Note: verified on BOTH 3.11.14 and 3.14 — the UF_HIDDEN check was
+    # backported, so do not assume a 3.11 venv is unaffected. (An earlier note
+    # here said "Python 3.14's site.py", which invited exactly that wrong
+    # conclusion.) The glob is python* so it covers whichever minor the venv is.
     if command -v chflags &>/dev/null; then
         chflags nohidden .venv/lib/python*/site-packages/_editable_impl_nexus_*.pth 2>/dev/null || true
     fi

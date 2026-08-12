@@ -2958,3 +2958,68 @@ def test_update_software_cancel_noop():
     """cancel() is safe — the update runs synchronously inside startup(), and an
     already-scheduled restart has no handle here to cancel."""
     UpdateSoftwareStep().cancel({})
+
+
+def test_unhide_pth_targets_the_venv_not_the_base_interpreter(monkeypatch, tmp_path):
+    """The .pth self-heal must chflags files inside the VENV's site-packages.
+
+    Regression test for a real bug: the original implementation derived the
+    directory with ``Path(venv_python).resolve().parent.parent / "lib"``. A
+    venv's ``bin/python`` is a symlink to the base interpreter, so ``resolve()``
+    walked straight out of the venv and globbed the BASE interpreter's lib dir
+    — matching zero files on the very layout ``python -m venv`` produces, which
+    meant the self-heal silently never ran. Measured 0 matches vs 3 real shims.
+
+    Asking the interpreter via ``sysconfig`` is immune to both the symlink and
+    the directory layout, which is what this pins.
+    """
+    monkeypatch.setattr(update_software_mod.sys, "platform", "darwin")
+
+    site_packages = tmp_path / "venv" / "lib" / "python3.11" / "site-packages"
+    site_packages.mkdir(parents=True)
+    shim = site_packages / "_editable_impl_nexus_common.pth"
+    shim.write_text("/some/src\n")
+    (site_packages / "unrelated.pth").write_text("/other\n")
+
+    chflagged = []
+
+    def _fake_run(cmd, **kwargs):
+        """Answer the sysconfig probe; record any chflags invocation."""
+        if cmd[:2] == ["/fake/venv/bin/python", "-c"]:
+            return _FakeCompleted(0, stdout=f"{site_packages}\n")
+        if cmd and cmd[0] == "chflags":
+            chflagged.append(cmd[-1])
+            return _FakeCompleted(0)
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(update_software_mod.subprocess, "run", _fake_run)
+    update_software_mod._unhide_editable_pth("/fake/venv/bin/python")
+
+    # Only the editable shim, and it must be the one inside the venv.
+    assert chflagged == [str(shim)]
+
+
+def test_unhide_pth_is_a_noop_off_darwin(monkeypatch):
+    """Linux has no chflags, so the helper must not shell out at all."""
+    monkeypatch.setattr(update_software_mod.sys, "platform", "linux")
+    monkeypatch.setattr(
+        update_software_mod.subprocess, "run",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not run anything on linux")),
+    )
+    update_software_mod._unhide_editable_pth("/fake/venv/bin/python")
+
+
+def test_unhide_pth_swallows_failures(monkeypatch):
+    """A failing probe must never break an otherwise-successful update.
+
+    This is a defensive touch-up, not part of the update itself, so an error
+    here must not turn a good `git pull` + reinstall into a failed step.
+    """
+    monkeypatch.setattr(update_software_mod.sys, "platform", "darwin")
+
+    def _boom(cmd, **kwargs):
+        """Fail the way a missing interpreter would."""
+        raise FileNotFoundError("/fake/venv/bin/python")
+
+    monkeypatch.setattr(update_software_mod.subprocess, "run", _boom)
+    update_software_mod._unhide_editable_pth("/fake/venv/bin/python")  # must not raise
