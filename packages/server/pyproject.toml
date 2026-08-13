@@ -5,6 +5,14 @@ description = "Nexus control plane API server"
 requires-python = ">=3.11"
 dependencies = [
     "nexus-common",
+    # AI Note: nexus_server.main does a hard `import nexus_steps` (to populate
+    # the step registry for /api/steps and submit-time validation), so this is a
+    # real runtime dependency, not a dev convenience. It was previously
+    # undeclared and only worked because dev.sh and Dockerfile.api happen to
+    # install all three packages explicitly — any consumer trusting the
+    # metadata (a wheel build, a downstream image, `uv sync --package
+    # nexus-server`) got a server that raised ModuleNotFoundError on import.
+    "nexus-steps",
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.30.0",
     "sqlalchemy[asyncio]>=2.0",

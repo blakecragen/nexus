@@ -3,7 +3,10 @@ name = "nexus"
 version = "0.1.0"
 description = "Distributed compute cluster management system"
 requires-python = ">=3.11"
-readme = "README.md"
+
+# AI Note: no `readme` key on purpose. It used to say `readme = "README.md"`,
+# but no README.md exists, so any PEP 621 metadata build of this workspace root
+# failed on the missing file. Re-add it only together with the actual file.
 
 [tool.uv.workspace]
 members = [
@@ -12,6 +15,34 @@ members = [
     "packages/agent",
     "packages/steps",
     "packages/cli",
+]
+
+# Test/lint tooling, declared so a clean clone can reproduce the suite.
+#
+# Only `pytest` and `pytest-asyncio` are genuinely test-only imports; everything
+# else the tests import (fastapi, httpx, sqlalchemy, paramiko, jwt, cryptography,
+# botocore, websockets, pydantic, starlette) already arrives as a runtime
+# dependency of one of the workspace packages. `pytest-cov` and `ruff` are here
+# because TESTING.md documents `--cov` and this file configures `[tool.ruff]`,
+# yet neither tool was installed — both documented commands failed outright.
+#
+# AI Note: this is a PEP 735 dependency group, NOT [project.optional-dependencies].
+# The root has no [build-system] and ships no package, so it is not installable
+# and an extra could not be requested from it. A dependency group needs no
+# buildable project. Install with `uv pip install --group dev` (or
+# `pip install --group dev` on pip >= 25.1) — or just `./dev.sh test`, which
+# picks a working mechanism for you.
+#
+# AI Note: the test suite does NOT require the packages to be pip-installed —
+# tests/conftest.py injects every `packages/*/src` onto sys.path itself, which is
+# what lets the agent tests import nexus_agent even though dev.sh deliberately
+# never installs packages/agent on the controller.
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
 ]
 
 [tool.pytest.ini_options]

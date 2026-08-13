@@ -24,21 +24,52 @@ don't depend on `pip install -e` working.
 values and points the database at in-memory SQLite — **no real DB, secrets, or
 network are touched**.
 
+### Install the test tooling
+
+The test/lint tools live in the PEP 735 `dev` dependency group in the root
+`pyproject.toml`. On a fresh clone they are **not** present — `./dev.sh` installs
+only the three runtime packages, so `python -m pytest` would fail with
+`No module named pytest`.
+
+```bash
+./dev.sh test          # installs the dev group if needed, then runs pytest
+```
+
+or install the group yourself:
+
+```bash
+uv pip install --group dev        # uv (any version with PEP 735 support)
+.venv/bin/python -m pip install --group dev   # pip >= 25.1 only
+```
+
+> Only `pytest` and `pytest-asyncio` are genuinely test-only. Everything else the
+> tests import (fastapi, httpx, sqlalchemy, paramiko, jwt, cryptography, botocore,
+> websockets) already arrives as a runtime dependency of a workspace package.
+> `pytest-cov` and `ruff` are in the group because the `--cov` command below and
+> the `[tool.ruff]` config both existed while neither tool was installed.
+
 ### Run
+
+`./dev.sh test` forwards every argument to pytest, so anything below works either
+way:
 
 ```bash
 # Everything
+./dev.sh test
 .venv/bin/python -m pytest
 
 # A layer
-.venv/bin/python -m pytest tests/unit
-.venv/bin/python -m pytest tests/integration
+./dev.sh test tests/unit
+./dev.sh test tests/integration
 
 # A single file, verbose
-.venv/bin/python -m pytest tests/unit/test_parser.py -v
+./dev.sh test tests/unit/test_parser.py -v
 
 # With coverage
-.venv/bin/python -m pytest --cov=packages --cov-report=term-missing
+./dev.sh test --cov=packages --cov-report=term-missing
+
+# Lint
+.venv/bin/python -m ruff check .
 ```
 
 ### Key fixtures (`tests/conftest.py`)

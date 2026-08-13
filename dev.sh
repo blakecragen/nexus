@@ -13,6 +13,7 @@
 #   ./dev.sh logs     # tail API + frontend logs
 #   ./dev.sh status   # check what's running
 #   ./dev.sh reset    # delete nexus.db and restart fresh
+#   ./dev.sh test     # install the dev dep group and run pytest (args forwarded)
 #
 # Layout it manages:
 #   Docker  — redis (:6379) + minio (:9000/:9001) from docker-compose.yml
@@ -497,6 +498,83 @@ start_all() {
     echo ""
 }
 
+# ── Tests ───────────────────────────────────────────────────────────────
+# Install the PEP 735 "dev" dependency group from pyproject.toml, then run
+# pytest. Every argument is forwarded, so `./dev.sh test tests/unit -k parser -x`
+# works.
+#
+# AI Note: three install mechanisms, tried in order, because none of them is
+# universally available here:
+#   1. `uv pip install --group` — uv is present on this machine and understands
+#      PEP 735 today. Preferred.
+#   2. `pip install --group`    — correct but needs pip >= 25.1; the venv ships
+#      24.0, where the flag does not exist.
+#   3. Parse the group out of pyproject.toml and install the names directly —
+#      the last resort, so an old pip still gets a working suite instead of an
+#      unexplained "No module named pytest".
+# Falling back rather than upgrading pip is deliberate: bumping the venv's pip
+# as a side effect of running tests is a surprising mutation.
+#
+# AI Note: the suite does NOT need the packages pip-installed — tests/conftest.py
+# puts every packages/*/src on sys.path itself. So this deliberately does not
+# call install_python(); `./dev.sh test` works on a clone whose editable installs
+# are broken, which is exactly when you want to run tests.
+ensure_dev_deps() {
+    local venv_py=".venv/bin/python"
+    if [[ ! -x "$venv_py" ]]; then
+        info "Creating virtual environment at .venv..."
+        python3 -m venv .venv
+    fi
+    if [[ -z "${PIP_INDEX_URL:-}" && -n "${UV_INDEX_URL:-}" ]]; then
+        export PIP_INDEX_URL="$UV_INDEX_URL"
+    fi
+
+    # Already satisfied? Then do nothing — keeps `./dev.sh test` fast.
+    if "$venv_py" -c "import pytest, pytest_asyncio, pytest_cov" &>/dev/null; then
+        return 0
+    fi
+
+    info "Installing the 'dev' dependency group..."
+    if command -v uv &>/dev/null && uv pip install --python "$venv_py" --group dev &>/dev/null; then
+        ok "Dev dependencies installed (uv)."
+        return 0
+    fi
+    if "$venv_py" -m pip install --quiet --group dev &>/dev/null; then
+        ok "Dev dependencies installed (pip --group)."
+        return 0
+    fi
+
+    warn "Neither 'uv --group' nor 'pip --group' worked — installing the group's contents directly."
+    local deps
+    deps=$("$venv_py" - <<'PY'
+import re, sys, pathlib
+try:                     # tomllib is stdlib on the 3.11+ this project requires
+    import tomllib
+except ModuleNotFoundError:
+    sys.exit(1)
+data = tomllib.loads(pathlib.Path("pyproject.toml").read_text())
+print(" ".join(data.get("dependency-groups", {}).get("dev", [])))
+PY
+    ) || true
+    if [[ -z "$deps" ]]; then
+        err "Could not read [dependency-groups].dev from pyproject.toml."
+        exit 1
+    fi
+    # shellcheck disable=SC2086 - deliberate word-splitting into separate specs
+    if ! "$venv_py" -m pip install --quiet $deps; then
+        err "Failed to install dev dependencies: $deps"
+        exit 1
+    fi
+    ok "Dev dependencies installed (direct)."
+}
+
+run_tests() {
+    ensure_dev_deps
+    info "Running pytest..."
+    echo ""
+    .venv/bin/python -m pytest "$@"
+}
+
 # ── Stop ────────────────────────────────────────────────────────────────
 # Tear everything down: API, frontend, docker services, pid files and logs.
 # Deliberately belt-and-braces — kill the recorded PID, then sweep the port,
@@ -622,5 +700,7 @@ case "${1:-}" in
     logs)   tail_logs ;;
     status) show_status ;;
     reset)  reset_all ;;
+    # `shift` so extra args reach pytest: ./dev.sh test tests/unit -k parser -x
+    test)   shift; run_tests "$@" ;;
     *)      start_all ;;
 esac
