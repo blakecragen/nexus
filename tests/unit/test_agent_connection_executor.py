@@ -481,6 +481,59 @@ async def test_run_treats_connection_closed_as_transient(no_sleep):
     assert no_sleep == [1]
 
 
+def _invalid_status_exc(status_code: int = 401):
+    """Build the exception a MODERN websockets client raises on a non-101 response.
+
+    `InvalidStatus(response)` only reads `response.status_code` in `__str__`, so a
+    tiny stand-in is enough and avoids depending on http11.Response's constructor.
+    """
+    import websockets.exceptions as wse
+
+    class _Resp:
+        def __init__(self, code):
+            self.status_code = code
+
+    return wse.InvalidStatus(_Resp(status_code))
+
+
+async def test_run_treats_a_rejected_handshake_as_transient(no_sleep):
+    """A server that REJECTS the handshake is retried, not fatal.
+
+    Regression test. run() used to catch `InvalidStatusCode` — the alias
+    websockets deprecated in 14.0 and lazily forwards to its legacy module —
+    while the modern asyncio client raises `InvalidStatus` on any non-101
+    response. So a wrong api_key (401) or an unrecognised node_id (404) raised an
+    exception that was NOT in the handler tuple: it escaped run(), killed the
+    agent process, and presented as a node going offline and never coming back
+    on its own. Catching the shared parent `InvalidHandshake` covers both names.
+    """
+    c = AgentConnection(_config())
+    _stub_connect(c, [_invalid_status_exc(401)])
+
+    await c.run()
+
+    assert no_sleep == [1]      # retried with backoff instead of propagating
+
+
+async def test_run_still_covers_the_legacy_handshake_exception(no_sleep):
+    """The deprecated legacy name is also still handled.
+
+    A node may be running an older websockets, so both must be transient. Pinning
+    the subclass relationship as well means this test keeps its meaning even after
+    websockets finally deletes the legacy alias.
+    """
+    import websockets.exceptions as wse
+
+    assert issubclass(wse.InvalidStatus, wse.InvalidHandshake)
+
+    c = AgentConnection(_config())
+    _stub_connect(c, [wse.InvalidHandshake("rejected")])
+
+    await c.run()
+
+    assert no_sleep == [1]
+
+
 async def test_run_clean_return_does_not_sleep_and_tight_loops(no_sleep):
     """A server that accepts then immediately closes reconnects with no delay.
 

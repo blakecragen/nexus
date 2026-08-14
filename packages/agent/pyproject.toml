@@ -6,7 +6,14 @@ requires-python = ">=3.11"
 dependencies = [
     "nexus-common",
     "nexus-steps",
-    "websockets>=13.0",
+    # AI Note: upper bound is load-bearing, not cosmetic. Nodes run
+    # `pip install -e packages/agent` fresh on EVERY provision (see
+    # nexus_deploy.py INSTALL_SH), so an unbounded range means every new node
+    # gets whatever released that day. That is how the agent ended up on
+    # websockets 17 while its reconnect loop still named the 14.0-deprecated
+    # InvalidStatusCode. uv.lock does NOT protect nodes — pip ignores it — so
+    # the range itself has to carry the constraint.
+    "websockets>=13.0,<18.0",
     "httpx>=0.27.0",
     "psutil>=6.0.0",
 ]
@@ -20,3 +27,13 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/nexus_agent"]
+
+# AI Note: required by `uv lock`/`uv sync`. Without these, uv refuses with
+# "<pkg> is included as a workspace member, but is missing an entry in
+# tool.uv.sources". Plain `pip install -e` does not read this table — it
+# resolves the sibling packages only because dev.sh installs them together in a
+# single command, which is also why `pip install -e packages/server` ALONE would
+# try to fetch nexus-common from the index and fail.
+[tool.uv.sources]
+nexus-common = { workspace = true }
+nexus-steps = { workspace = true }

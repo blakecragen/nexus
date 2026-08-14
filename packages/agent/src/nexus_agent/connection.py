@@ -125,15 +125,33 @@ class AgentConnection:
                 backoff = INITIAL_BACKOFF
             except (
                 websockets.exceptions.ConnectionClosed,
-                websockets.exceptions.InvalidStatusCode,
+                websockets.exceptions.InvalidHandshake,
                 OSError,
             ) as exc:
                 # AI Note: This tuple is the "expected transient failure" set:
-                # dropped socket, HTTP-level rejection during the handshake,
+                # dropped socket, any HTTP-level rejection during the handshake,
                 # and DNS/refused-connection errors. Anything outside it
                 # (e.g. a Pydantic ValidationError) escapes the loop and kills
                 # the agent process — intentionally loud, since those indicate
                 # a protocol mismatch rather than a flaky network.
+                #
+                # AI Note: catch InvalidHandshake, the PARENT of both
+                # InvalidStatus (modern) and InvalidStatusCode (legacy, a
+                # deprecated lazy alias into websockets.legacy since 14.0).
+                # This used to name InvalidStatusCode alone, which was wrong in
+                # two ways: the modern asyncio client raises InvalidStatus on a
+                # non-101 response, so a handshake rejection — a wrong api_key
+                # (401), a node_id the server does not recognise (404) — was
+                # NOT caught, escaped this loop, and killed the agent process
+                # instead of backing off and retrying. That presents as a node
+                # going offline and never coming back on its own. And once
+                # websockets drops the legacy module, merely *evaluating* the
+                # old tuple raises AttributeError while Python is selecting the
+                # handler, crashing the loop on the first connection error.
+                # The parent class covers every handshake failure and is stable
+                # across websockets 13 -> 17+, which matters because nodes
+                # `pip install -e packages/agent` fresh on every provision and
+                # therefore get whatever version is newest that day.
                 logger.warning("Connection lost: %s. Reconnecting in %ds...", exc, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, MAX_BACKOFF)
@@ -230,7 +248,7 @@ class AgentConnection:
         normally because the server closed the socket.
 
         Raises:
-            websockets.exceptions.ConnectionClosed / InvalidStatusCode /
+            websockets.exceptions.ConnectionClosed / InvalidHandshake /
             OSError: Propagated to `run()`, which handles backoff. Any
             exception raised inside the heartbeat or listener task is
             re-raised here via `task.result()`.

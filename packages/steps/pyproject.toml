@@ -13,3 +13,12 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/nexus_steps"]
+
+# AI Note: required by `uv lock`/`uv sync`. Without these, uv refuses with
+# "<pkg> is included as a workspace member, but is missing an entry in
+# tool.uv.sources". Plain `pip install -e` does not read this table — it
+# resolves the sibling packages only because dev.sh installs them together in a
+# single command, which is also why `pip install -e packages/server` ALONE would
+# try to fetch nexus-common from the index and fail.
+[tool.uv.sources]
+nexus-common = { workspace = true }
